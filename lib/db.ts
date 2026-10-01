@@ -11,7 +11,7 @@ import {
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS cases (
   is_deleted   INTEGER NOT NULL DEFAULT 0,
   created_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
   created_on   INTEGER NOT NULL,
+  updated_by   INTEGER REFERENCES users(id) ON DELETE SET NULL,
   updated_on   INTEGER NOT NULL,
   source       TEXT,
   source_id    INTEGER

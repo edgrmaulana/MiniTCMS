@@ -34,6 +34,9 @@ separate `COUNT(*)` with the same `WHERE`, not `rows.length`.
   page })` — `search` hits `title` and `refs`, parameterised `LIKE`.
 - `getCase`, `createCase`, `updateCase`, `deleteCase` (soft: set
   `is_deleted`, keep history intact — a hard delete orphans results).
+  `createCase` writes all four authorship columns, `updateCase` writes
+  `updated_by` and `updated_on` on every call — never only the
+  timestamp. Both are nullable because an import may not know who.
 - `bulkMoveCases(caseIds, sectionId)` and `bulkUpdateCases` — one
   statement with an `IN` list, chunked at 500 ids. Phase 4 imports lean
   on these.
@@ -60,6 +63,9 @@ separate `COUNT(*)` with the same `WHERE`, not `rows.length`.
   warning in the report.
 - Validation on write: value must match the declared type. A dropdown
   value not in `configs` is rejected loud, not coerced.
+- Definitions are keyed on `system_name` and upserted, so a CSV import
+  that can only infer `type: 'text'` (phase 4, 6.4) is corrected in
+  place by a later API import rather than duplicated.
 - `is_global` or per-project scoping via `configs.context`, same shape
   as TestRail.
 

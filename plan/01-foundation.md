@@ -4,9 +4,10 @@ Goal: one SQLite module that owns the whole schema, one constants module
 that owns every status/priority/type id, and a test harness that gives
 each test a fresh database. Nothing user-facing ships here.
 
-**Status: done.** Schema version 4: 17 tables, 34 indexes, the five
-built-in statuses seeded. `lib/format.ts` owns the constants. 45 tests
-pass.
+**Status: done.** Schema version 5: 17 tables, 34 indexes, the five
+built-in statuses seeded. `lib/format.ts` owns the constants. 51 tests
+pass. v5 added `cases.updated_by` — both TestRail entry points carry an
+updating user and there was nowhere to put it.
 
 | Section | State |
 |---------|-------|
@@ -42,7 +43,7 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
-## 2. Schema v4
+## 2. Schema v5
 
 All tables created up front even though phases 2 and 3 fill them — one
 `db.exec`, one review.
@@ -56,7 +57,8 @@ sections        id, suite_id, parent_id, depth, display_order, name,
                 description, source, source_id
 cases           id, section_id, suite_id, title, template_id, type_id,
                 priority_id, refs, estimate, milestone_id, custom JSON,
-                created_by, created_on, updated_on, source, source_id
+                is_deleted, created_by, created_on, updated_by,
+                updated_on, source, source_id
 case_fields     id, system_name, label, type, is_global, configs JSON,
                 source, source_id
 milestones      id, project_id, parent_id, name, description, due_on,

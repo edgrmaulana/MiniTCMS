@@ -6,13 +6,20 @@ data. Treat a lost field as a bug of the same severity as a crash.
 Depends on phases 1-3. Blocks nothing — but nothing else matters if this
 is wrong.
 
-**Status: not started.** No client, no mapping, no pipeline. The one
-thing already in place is the shape that makes it replayable: every
-importable table carries `(source, source_id)` with a UNIQUE index, and
-`users` already follows it.
+**Status: not started.** No client, no reader, no mapping, no pipeline.
+The one thing already in place is the shape that makes it replayable:
+every importable table carries `(source, source_id)` with a UNIQUE
+index, and `users` already follows it. Schema v5 added `cases.updated_by`
+because both entry points carry it.
+
+Two entry points, equal weight: the API (sections 1-5) and a CSV case
+export (section 6). The CSV is not a degraded mode — it is what a team
+without API access can actually produce, and it was the first real
+sample this project saw.
 
 Done when: a real TestRail instance imports twice in a row and the
-second run reports zero inserts, zero updates, zero errors.
+second run reports zero inserts, zero updates, zero errors; and a real
+CSV export does the same.
 
 ## 1. Client — `lib/testrail.ts`
 
@@ -88,7 +95,11 @@ Known translations:
   `custom.steps` unchanged — the shapes were chosen to match in phase 2.
 - **users** resolve by email, not by id or name. A result from a deleted
   TestRail user keeps `created_by = NULL` and is counted in the report;
-  it is never reassigned to anyone.
+  it is never reassigned to anyone. The CSV path has no email to resolve
+  against and relaxes this under protest — see 6.2.
+- **authorship** is four columns, not two: `created_by`/`created_on` and
+  `updated_by`/`updated_on`. Schema v5 added `cases.updated_by` for it.
+  Both entry points carry all four.
 - **HTML/markdown**: TestRail stores a markdown dialect. Store verbatim.
   Rendering is the UI's problem; rewriting user content during a
   migration is how data gets silently mangled.
@@ -133,23 +144,153 @@ Counts that do not reconcile (fetched != inserted + updated + unchanged
 + skipped) are a hard failure, not a warning. A migration that cannot
 account for every row has not succeeded.
 
-## 6. CSV fallback
+## 6. CSV import — `lib/migrate/csv.ts`
 
-Not every TestRail plan exposes the API. A second entry point reads
-TestRail's CSV case export into the same `mapCase` function:
-cases only, no runs or results, `source = 'testrail-csv'`. Build it
-after the API path works and only if the API path is not enough — this
-is the first thing to cut if phase 4 runs long.
+Not a fallback. Not the first thing to cut. A CSV case export is what a
+team can always produce — API access needs a plan tier and an admin
+willing to issue a key, and the first real sample this project was
+handed was a CSV, not a JSON dump. Both entry points ship.
+
+It is a different format, not a thinner one, so it gets its own reader
+and its own mapper. `mapCsvCase` is a sibling of `mapCase`, not a
+caller of it: the API sends ids, the CSV sends labels.
+
+### 6.1 What the format is
+
+Measured against a real 243-case export, not assumed:
+
+- UTF-8, **CRLF**, RFC 4180 quoting with doubled quotes.
+- **Fields contain newlines** — 241 of 243 rows did. Anything that
+  splits on `\n` before parsing is wrong on row one. Use a real parser.
+- **Header names repeat.** `Steps` appeared twice in a Text-template
+  export. Address columns **by index**, never by a `Record<string,…>`
+  built from the header row, or one of them is silently lost.
+- Column set is not fixed: it is whatever the exporting user ticked,
+  plus that instance's custom fields. Treat the header as data.
+- Values are **labels**: `Priority` is `"Medium"`, `Type` is `"Other"`,
+  `Template` is `"Test Case (Text)"`. No ids anywhere except `ID` and
+  `Suite ID`.
+
+### 6.2 What the CSV cannot tell us
+
+Each of these is a decision, and rule 4 says none of them gets a
+guessed default. Every one is either an operator input or a NULL plus a
+line in the report.
+
+| Missing | What happens |
+|---|---|
+| **Project** | No column exists. The operator names the target project, or passes `--project <id>`. Not inferred from the suite name. |
+| **Timezone** | `Created On` is `"10/1/2026 6:26 PM"` — locale-ordered, 12-hour, no offset. The operator passes `--tz` and `--date-order mdy\|dmy`; without both, the import refuses to start rather than guessing which of the two dates in `1/2/2026` is the month. |
+| **User identity** | `Created By` is a display name (`"edgar"`), not an email. Names resolve against existing `users.name` only on an exact unique match; anything ambiguous or unknown leaves `created_by`/`updated_by` NULL and lands in `report.unmapped`. A `--users name=email,…` map is the explicit override. |
+| **Section ids** | Only a path string. See 6.3. |
+| **Custom field definitions** | No `get_case_fields` equivalent. See 6.4. |
+| **Attachments** | The column holds filenames at best; the bytes live behind the API. Every non-empty value is a `report.skipped` line with the case id. Never silently dropped, never faked. |
+| **Runs, results, plans, milestones** | Not in a case export at all. Cases only. |
+
+### 6.3 Sections from a path
+
+`Section Hierarchy` is `"root > child > leaf"`, with `Section` holding
+the leaf and `Section Depth` holding the 0-indexed depth. On the sample,
+`depth == segments - 1` and `segments[-1] == Section` held for all 243
+rows.
+
+- Split on `" > "`, then **assert both invariants per row** and fail
+  loud with the case id when either breaks. The separator is ambiguous
+  if a section name contains it; the invariants are the detector, and a
+  wrongly split path silently reparents a whole subtree.
+- Build the distinct path set first, insert shortest-first so a parent
+  always precedes its child, then insert cases.
+- Reject `depth >= MAX_SECTION_LEVELS` loud. The schema CHECK would
+  reject it anyway; catching it in the mapper names the case id.
+- Sections carry no source id, so `(source, source_id)` cannot key
+  them. Idempotency is on the **resolved path within the suite**: the
+  importer keeps a `Map<path, sectionId>` and looks up before
+  inserting. A second run of the same CSV creates no sections.
+
+### 6.4 Custom fields from column headers
+
+- Every column that is not one of TestRail's built-ins is a custom
+  field. Slugify the header to a `system_name` (`Business_Unit` →
+  `business_unit`) and upsert a `case_fields` row with
+  `type = 'text'`, `source = 'testrail-csv'`.
+- `text` is honest, not lazy: a CSV cell carries no type, and inventing
+  `dropdown` from the distinct values seen would be inventing data. An
+  API import later corrects the definition in place, keyed on
+  `system_name`.
+- Values land in `cases.custom` under that `system_name`, verbatim.
+  Empty string imports as absent, not as `""`.
+- TestRail's standard text-template fields are the exception and map to
+  the names phase 2 already uses: `Preconditions` → `custom.preconds`,
+  `Steps` → `custom.steps_text`, `Expected Result` → `custom.expected`.
+
+### 6.5 Steps-template exports
+
+Not covered by the sample, so it is built against a second export
+before the phase is called done. A Steps-template export repeats the
+case across **several rows**, one per step, with
+`Steps (Step)` / `(Expected Result)` / `(References)` filled and the
+other columns repeated or blank.
+
+- Group rows by `ID` in file order, fold the step columns into
+  `custom.steps` as `{ content, expected, refs }` — the same shape
+  `custom_steps_separated` lands in from the API.
+- A repeated `ID` whose non-step columns disagree between rows is a
+  hard error, not a last-write-wins.
+- Until that second export exists: a file with any `Steps (…)` column
+  non-empty refuses to import, with the reason. Half-reading a steps
+  export is worse than declining it.
+
+### 6.6 Labels to ids
+
+`lib/migrate/map.ts` owns this, same as the API path:
+
+- `Priority` and `Type` match `CASE_PRIORITY` / `CASE_TYPE` on a
+  case-insensitive label match. No match is **not** a silent `other` —
+  the row imports with a NULL and a `report.unmapped` line naming the
+  label, so the operator can add it and re-run.
+- `Template` maps `"Test Case (Text)"` → `CASE_TEMPLATE.text`,
+  `"Test Case (Steps)"` → `.steps`, `"Exploratory Session"` →
+  `.exploratory`. An unknown template name is a hard error: it decides
+  how the step columns are read.
+- `ID` is `C7104597` → `source_id` 7104597; `Suite ID` is `S928` → 928.
+  Strip exactly one leading letter and require digits after it.
+
+### 6.7 Running it alongside the API import
+
+`source = 'testrail-csv'` and `source = 'testrail'` are distinct, and
+`UNIQUE(source, source_id)` is per-source — so importing a CSV and then
+the API would land **every case twice**. This is the trap the schema
+does not catch.
+
+- The importer refuses to run when the target project already holds
+  rows from the other source, and says which one, unless
+  `--allow-mixed-sources` is passed.
+- The documented path is CSV first to evaluate, then
+  `npm run migrate -- --reset-project <id>` before the real API run.
+  Documented in `README.md` the turn it ships.
+
+### 6.8 The report
+
+Same reconciliation rule as the API path: rows parsed must equal
+inserted + updated + unchanged + skipped, or the import is a failure.
+Plus, specific to CSV: the header columns recognised, the columns
+treated as custom fields, and the sections synthesised.
 
 ## 7. Interfaces
 
-- CLI: `npm run migrate -- --dry-run`, `npm run migrate -- --resume`,
-  `--project <trId>` to scope a trial import. The CLI is the real
-  interface; it is what a self-hoster runs in a terminal against a big
-  instance.
-- UI: `app/migrate/` wraps the same functions — credentials form, a
-  dry-run preview, start, live progress from `import_runs`, and the
-  report. The UI never reimplements the pipeline.
+- CLI, API path: `npm run migrate -- --dry-run`,
+  `npm run migrate -- --resume`, `--project <trId>` to scope a trial
+  import. The CLI is the real interface; it is what a self-hoster runs
+  in a terminal against a big instance.
+- CLI, CSV path:
+  `npm run migrate:csv -- <file> --project <id> --tz <zone> --date-order mdy`,
+  plus `--dry-run`, `--users <map>`, `--allow-mixed-sources`. Same
+  report, same reconciliation rule.
+- UI: `app/migrate/` wraps the same functions — a credentials form for
+  the API, a file upload for the CSV, a dry-run preview, start, live
+  progress from `import_runs`, and the report. The UI never
+  reimplements the pipeline. The CSV upload is the easier of the two to
+  ship and is the one a first-time evaluator reaches for.
 
 ## 8. Tests
 
@@ -169,8 +310,33 @@ Fixture-driven, no network:
 Client tests mock `fetch`: pagination over three pages, a 429 with
 `Retry-After` honoured, a bare-array response from an old version.
 
+CSV tests run off a small hand-written fixture that reproduces the
+traps the real export has, in `lib/migrate/csv.test.ts`:
+
+- A quoted field containing CRLF, a comma and a doubled quote parses to
+  one value.
+- A header with `Steps` twice keeps both columns distinct.
+- `"a > b > c"` with `Section Depth` 2 builds three sections, parents
+  first; a second pass over the same file adds none.
+- A row whose depth disagrees with its segment count fails loud and
+  names the case id.
+- A path 7 levels deep is rejected against `MAX_SECTION_LEVELS`.
+- An unknown `Priority` label imports the case with NULL and one
+  `report.unmapped` line — it does not become `other`.
+- A missing `--tz` refuses the import.
+- A non-empty `Attachments` cell produces a `report.skipped` line and
+  the case still imports.
+- A file with a `Steps (Step)` column refuses, until 6.5 is built.
+
+The fixture is written by hand from the shapes documented in 6.1. A
+real customer export is never committed — it carries live endpoints,
+traffic volumes and staff names, and this repo is public (AGENTS.md
+rules 11 and 15).
+
 ## 9. Checks
 
 `npm run test`, `npm run lint`, `npm run build`. Plus one real dry-run
-against a live instance before calling the phase done — fixtures do not
-catch a wrong URL shape.
+against a live instance and one against a real CSV export before
+calling the phase done — fixtures do not catch a wrong URL shape, and
+they do not catch a column the exporting user ticked that nobody
+anticipated.

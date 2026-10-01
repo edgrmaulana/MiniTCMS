@@ -96,7 +96,7 @@ What is built and what is not is listed in
 
 ## Data model
 
-Schema version 4: 17 tables, created in one block and guarded by a
+Schema version 5: 17 tables, created in one block and guarded by a
 stamp that is read before anything else is applied.
 
 ```text
