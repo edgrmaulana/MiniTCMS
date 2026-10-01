@@ -22,6 +22,18 @@ const SCRYPT_P = 1;
 const SCRYPT_KEY_BYTES = 64;
 const SALT_BYTES = 16;
 
+// Bounds for the parameters read back out of a stored hash. Outside these,
+// node's scrypt throws RangeError, which would escape the server action as a
+// 500 instead of a rejected sign-in.
+const MIN_SCRYPT_N = 1024;
+const MAX_SCRYPT_N = 1 << 22;
+const MAX_SCRYPT_R = 32;
+const MAX_SCRYPT_P = 16;
+
+// 128 * N * r is the working set; node's default cap of 32MB is below what
+// N=16384 r=8 already needs on the raise path, so both sides pass it.
+const maxmemFor = (cost: number, blockSize: number) => 256 * cost * blockSize;
+
 export const SESSION_COOKIE = "minitcms_session";
 export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 export const LOGIN_WINDOW_SECONDS = 15 * 60;
@@ -33,6 +45,7 @@ export async function hashPassword(password: string): Promise<string> {
     N: SCRYPT_N,
     r: SCRYPT_R,
     p: SCRYPT_P,
+    maxmem: maxmemFor(SCRYPT_N, SCRYPT_R),
   });
   return [
     "scrypt",
@@ -52,20 +65,41 @@ export async function verifyPassword(password: string, stored: string): Promise<
   const cost = Number(costText);
   const blockSize = Number(blockText);
   const parallel = Number(parallelText);
-  if (!Number.isFinite(cost) || !Number.isFinite(blockSize) || !Number.isFinite(parallel)) {
-    return false;
-  }
+
+  // A power of two in range, because scrypt rejects anything else by throwing.
+  const costUsable =
+    Number.isInteger(cost) &&
+    cost >= MIN_SCRYPT_N &&
+    cost <= MAX_SCRYPT_N &&
+    (cost & (cost - 1)) === 0;
+  const sizesUsable =
+    Number.isInteger(blockSize) &&
+    blockSize > 0 &&
+    blockSize <= MAX_SCRYPT_R &&
+    Number.isInteger(parallel) &&
+    parallel > 0 &&
+    parallel <= MAX_SCRYPT_P;
+  if (!costUsable || !sizesUsable) return false;
 
   const expected = Buffer.from(hashText, "base64");
-  const derived = await scryptAsync(
-    password.normalize("NFKC"),
-    Buffer.from(saltText, "base64"),
-    expected.length,
-    // maxmem must cover 128 * N * r, which exceeds the 32MB default past N=16384.
-    { N: cost, r: blockSize, p: parallel, maxmem: 256 * cost * blockSize },
-  );
+  const salt = Buffer.from(saltText, "base64");
+  /*
+    The length check is the whole guard, not a sanity check. Buffer.from
+    ignores invalid base64 rather than throwing, so a truncated or corrupted
+    tail decodes to zero bytes; deriving a zero-length key then compares equal
+    to it and every password verifies. Pin both lengths to what hashPassword
+    writes and the decoded value can never be short.
+  */
+  if (expected.length !== SCRYPT_KEY_BYTES || salt.length !== SALT_BYTES) return false;
 
-  return derived.length === expected.length && timingSafeEqual(derived, expected);
+  const derived = await scryptAsync(password.normalize("NFKC"), salt, expected.length, {
+    N: cost,
+    r: blockSize,
+    p: parallel,
+    maxmem: maxmemFor(cost, blockSize),
+  });
+
+  return timingSafeEqual(derived, expected);
 }
 
 // Verified against this when the email is unknown, so a missing account costs
@@ -73,7 +107,14 @@ export async function verifyPassword(password: string, stored: string): Promise<
 let decoyHash: Promise<string> | null = null;
 
 export async function verifyAgainstDecoy(password: string): Promise<false> {
-  if (!decoyHash) decoyHash = hashPassword(randomBytes(32).toString("base64"));
+  if (!decoyHash) {
+    // Cleared on rejection: a cached rejected promise would turn every later
+    // unknown-email sign-in into a 500 for the life of the process.
+    decoyHash = hashPassword(randomBytes(32).toString("base64")).catch((error) => {
+      decoyHash = null;
+      throw error;
+    });
+  }
   await verifyPassword(password, await decoyHash);
   return false;
 }

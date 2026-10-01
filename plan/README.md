@@ -12,8 +12,8 @@ and *when*; AGENTS.md is the *how*.
 
 | # | File | Ships | Status |
 |---|------|-------|--------|
-| 1 | `01-foundation.md` | SQLite layer, schema, constants, test harness | partial |
-| 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields | not started |
+| 1 | `01-foundation.md` | SQLite layer, schema, constants, test harness | done |
+| 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields | next |
 | 3 | `03-execution.md` | Milestones, plans, runs, tests, append-only results | not started |
 | 4 | `04-testrail-migration.md` | TestRail client, field mapping, resumable import, report | not started |
 | 5 | `05-ui.md` | App shell and the five screens that make it usable | partial |
@@ -27,9 +27,9 @@ lying.
 Phases 1→4 are strictly ordered. Phase 5 can start once phase 2 lands.
 Phase 7 is last.
 
-Phase 6 jumped the queue: the login page is built, which pulled the
-`users`, `sessions` and `login_attempts` slice of the phase 1 schema
-forward with it. Phase 1 extends that file rather than creating it.
+Phase 6 jumped the queue: the login page was built first, which pulled
+the `users`, `sessions` and `login_attempts` slice of the phase 1 schema
+forward with it. Phase 1 has since landed the rest, at schema version 4.
 
 ## Scope
 

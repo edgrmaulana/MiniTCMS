@@ -4,18 +4,19 @@ Goal: one SQLite module that owns the whole schema, one constants module
 that owns every status/priority/type id, and a test harness that gives
 each test a fresh database. Nothing user-facing ships here.
 
-**Status: partial.** Bootstrap and the test harness are done. The schema
-is 4 tables of the 15 below, and `lib/format.ts` holds only the user
-role; the status, priority, type and pagination constants do not exist
-yet.
+**Status: done.** Schema version 4: 17 tables, 34 indexes, the five
+built-in statuses seeded. `lib/format.ts` owns the constants. 45 tests
+pass.
 
 | Section | State |
 |---------|-------|
 | 1 Database bootstrap | done |
-| 2 Schema | partial - auth tables only, at version 2 |
-| 3 Indexes | partial - the 5 auth indexes |
-| 4 Constants | partial - `USER_ROLES` and the row types only |
+| 2 Schema | done |
+| 3 Indexes | done |
+| 4 Constants | done |
 | 5 Test harness | done |
+
+Phase 2 is unblocked.
 
 Done when: `npm run test` runs real tests against a temp DB, and
 `npm run build` passes with `lib/db.ts` imported by one smoke route.
@@ -26,22 +27,25 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - `PRAGMA journal_mode = WAL`, `PRAGMA foreign_keys = ON`. Both on every
   connection — foreign keys are off by default in SQLite and silently
   so.
-- Single `db.exec(SCHEMA)` block on first open, guarded by a
-  `schema_version` table.
-- **Already shipped, out of order:** `lib/db.ts` exists at schema
-  version 2 with `users`, `sessions` and `login_attempts`, because the
-  login page in `06-auth-and-api.md` needed them. This phase extends
-  that file to version 3 with the tables below and bumps
-  `SCHEMA_VERSION`. A mismatched stamp throws on open, so an old
-  `data.db` fails loud instead of half-working. Until the first release
-  there is no migration path: bump the stamp and `rm -f data.db*`.
+- `schema_version` is created and read **before** any other DDL runs, so a
+  database from another build is refused without being touched. Creating
+  its missing tables first and complaining afterwards is exactly the
+  half-working this guard exists to prevent.
+- A failed open closes the handle. `getDb` does not cache a failure, so
+  without that every request against a stale file would leak another
+  handle and its WAL lock.
+- The auth tables shipped first, at version 2, because the login page
+  needed them. Version 3 adds the rest. A mismatched stamp throws on
+  open, so an old `data.db` fails loud instead of half-working. Until
+  the first release there is no migration path: bump the stamp and
+  `rm -f data.db*`.
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
-## 2. Schema v1
+## 2. Schema v4
 
-Tables created now even if phases 2 and 3 fill them — one `db.exec`,
-one review.
+All tables created up front even though phases 2 and 3 fill them — one
+`db.exec`, one review.
 
 ```text
 projects        id, name, announcement, suite_mode, is_completed,
@@ -80,7 +84,27 @@ import_runs     id, source, started_on, finished_on, state, cursor JSON,
 
 - Every importable table ends with `source TEXT, source_id INTEGER` and
   `UNIQUE(source, source_id)`. This is what makes phase 4 replayable —
-  it is cheaper now than as a migration later.
+  it is cheaper now than as a migration later. SQLite treats NULLs as
+  distinct in a unique index, so native rows (both columns NULL) never
+  collide with each other, and `'testrail'` and `'testrail-csv'` can
+  carry the same id without a clash. Both are tested.
+- Delete behaviour is chosen per edge, not copied:
+  `projects → suites → sections` cascades, `cases.section_id` and
+  `tests.case_id` are `SET NULL`. Deleting a case must never delete the
+  record that it once ran — `title_snapshot` is why the test survives.
+- `results.status_id` and `tests.status_id` are real foreign keys onto
+  `statuses`, so a result can never reference a status that does not
+  exist. The five built-ins are seeded on open at TestRail's ids.
+- `CHECK` constraints on `role`, `suite_mode`, section `depth` and
+  attachment `entity_type`, every one interpolated from the matching
+  constant in `lib/format.ts` at module load. The phase 4 import writes
+  these columns from somebody else's data; an application-layer check
+  alone would not hold, and a hand-written value list drifts from its
+  constant in silence.
+- `cases`, `tests` and `results` use `AUTOINCREMENT`. SQLite otherwise
+  reuses `max(rowid) + 1`, and because `attachments` is polymorphic with
+  no foreign key, a new case landing on a deleted case's id would
+  silently inherit its files.
 - `tests.status_id` is a denormalised cache of the latest result. It is
   written only by the same transaction that inserts a result (phase 3),
   never by hand.
@@ -107,17 +131,30 @@ the hottest read in the product.
 
 ## 4. Constants — `lib/format.ts`
 
-Shared client+server. No DB import. **Exists** with `USER_ROLES`,
-`isUserRole`, `UserRow` and `SessionUser`; everything below is still to
-write.
+Shared client+server. No DB import.
 
 - `RESULT_STATUS`: passed 1, blocked 2, untested 3, retest 4, failed 5.
   TestRail's built-in ids, kept deliberately so phase 4 maps 1:1. Custom
   statuses start at 6, same as TestRail.
-- `CASE_PRIORITY`, `CASE_TYPE`, `SUITE_MODE` (1 single, 2 single+baselines,
-  3 multi).
-- `PAGE_SIZES = [25, 50, 100]`, `clampPageSize`, `clampPage`. Every list
-  query in every later phase uses these — no second pager.
+- `SUITE_MODE` (1 single, 2 single+baselines, 3 multi) and
+  `CASE_TEMPLATE` (1 text, 2 steps, 3 exploratory) are TestRail's fixed
+  values and map straight across.
+- `CASE_PRIORITY` and `CASE_TYPE` are **ours, not TestRail's**. A
+  TestRail admin can add, rename and reorder both, so assuming the ids
+  line up would be inventing data. The import reads `get_priorities`
+  and `get_case_types` and translates in `lib/migrate/map.ts`.
+- `PAGE_SIZES = [25, 50, 100]`, `clampPageSize`, `clampPage`,
+  `offsetFor`. Every list query in every later phase uses these — no
+  second pager. `clampPage` has a `MAX_PAGE` ceiling: unbounded, an
+  absurd `?page=` multiplies into an offset SQLite cannot bind, and the
+  route 500s instead of returning an empty page. `offsetFor` clamps both
+  of its arguments itself rather than trusting the caller to have done
+  it.
+- `MAX_SECTION_LEVELS`, named for levels rather than for a maximum depth
+  because `depth` is 0-indexed. `depth <= MAX_SECTION_DEPTH` is the
+  guard a reader writes by reflex, and it is off by one against the
+  CHECK — hence the name.
+- `ATTACHMENT_ENTITIES`, interpolated into the `entity_type` CHECK.
 - Shared TS types for every row above. Rows are plain objects; no
   classes.
 

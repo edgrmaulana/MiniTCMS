@@ -56,11 +56,43 @@ export async function endSession(): Promise<void> {
   cookieStore.delete(SESSION_COOKIE);
 }
 
-// Only meaningful behind a proxy you control; a direct-to-internet deployment
-// can have this header spoofed, so it throttles alongside the email, not alone.
+export const UNKNOWN_ADDRESS = "unknown";
+
+/*
+  How many proxies you run in front of this app, from TRUSTED_PROXY_HOPS.
+  Zero - the default, and what the documented compose file deploys - means
+  x-forwarded-for is whatever the caller typed, because Next passes the
+  client's header through untouched rather than appending the socket peer.
+  Measured, not assumed: a request carrying "X-Forwarded-For: 203.0.113.99"
+  arrives with exactly that value and nothing else.
+*/
+function trustedProxyHops(): number {
+  const configured = Number(process.env.TRUSTED_PROXY_HOPS ?? 0);
+  return Number.isInteger(configured) && configured > 0 ? configured : 0;
+}
+
+/*
+  The address is only as trustworthy as the topology. With no proxy declared
+  there is no honest answer, so this says so and the caller drops the
+  address throttle rather than throttling on a value an attacker picks - a
+  spoofable per-IP limit is worse than none, because it reads as protection
+  while handing out a fresh bucket per request.
+
+  With N proxies declared, the last N entries were appended by machines you
+  own; the entry just before them is the furthest left that is still real.
+*/
 export async function clientAddress(): Promise<string> {
+  const hops = trustedProxyHops();
+  if (hops === 0) return UNKNOWN_ADDRESS;
+
   const requestHeaders = await headers();
   const forwarded = requestHeaders.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0].trim();
-  return requestHeaders.get("x-real-ip")?.trim() ?? "unknown";
+  if (forwarded) {
+    const chain = forwarded.split(",").map((hop) => hop.trim()).filter(Boolean);
+    const trustworthy = chain.length - hops;
+    if (trustworthy >= 0 && trustworthy < chain.length) return chain[trustworthy];
+    return UNKNOWN_ADDRESS;
+  }
+
+  return requestHeaders.get("x-real-ip")?.trim() || UNKNOWN_ADDRESS;
 }

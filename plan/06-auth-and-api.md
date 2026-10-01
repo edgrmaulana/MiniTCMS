@@ -42,7 +42,16 @@ from the TestRail import.
   random salt per user. Stdlib, no dependency. Stored as
   `scrypt$N$r$p$salt$hash` so the parameters can be raised later without
   invalidating existing hashes. Never lower N to speed up a test.
-- **`timingSafeEqual`** for the comparison, never `===`.
+- **`timingSafeEqual`** for the comparison, never `===`, and the decoded
+  key and salt lengths are pinned to what `hashPassword` writes.
+  `Buffer.from` ignores invalid base64 instead of throwing, so without
+  that check a truncated hash decoded to zero bytes, derived a
+  zero-length key, compared equal, and **every password verified**. Any
+  row the import left half-written would have been an account takeover.
+- **Out-of-range scrypt parameters return false, never throw.** `N` must
+  be a power of two in range and `r`/`p` small positive integers;
+  otherwise node raises `RangeError` out of the server action and a
+  single corrupt row turns sign-in into a 500 instead of a rejection.
 - **Decoy verification.** An unknown email still runs a full scrypt
   verification against a throwaway hash, so a missing account costs the
   same wall time as a wrong password. Without it the form is a user
@@ -56,11 +65,20 @@ from the TestRail import.
 - **Cookie**: `httpOnly`, `sameSite=lax`, `secure` in production,
   `path=/`, 7-day `maxAge`. SameSite plus Next's server-action origin
   check is the CSRF story; there is no separate token to get wrong.
-- **Rate limiting** in SQLite: 8 failures per email per 15 minutes,
-  32 per client address over the same window. Counters clear on success.
-  The address is secondary on purpose — `x-forwarded-for` is spoofable
-  unless you own the proxy, so it tightens the screw but never holds the
-  door alone.
+- **Rate limiting** in SQLite: 8 failures per email per 15 minutes, and
+  32 per client address over the same window. Counters clear on success,
+  and rows outside the window are pruned on every attempt so an
+  attacker-supplied identifier cannot grow the table without bound.
+- **The address throttle is off unless you declare your topology.**
+  `TRUSTED_PROXY_HOPS` defaults to 0, and at 0 `clientAddress()` returns
+  `unknown` and the address bucket is skipped entirely. Measured, not
+  assumed: Next passes the caller's `x-forwarded-for` straight through
+  rather than appending the socket peer, so with no proxy in front the
+  header is simply what the attacker typed. A spoofable per-IP limit is
+  worse than none — it reads as protection while handing out a fresh
+  bucket per request. Set `TRUSTED_PROXY_HOPS=1` behind one proxy you
+  own and the entry that proxy appended is used. The per-email throttle
+  is unaffected and always applies.
 - **Password floor** 12 characters, ceiling 1024 (a scrypt DoS guard).
   No composition rules: length beats a required punctuation mark.
 - **Bootstrap reads the password from stdin**, never argv, so it stays

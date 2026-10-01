@@ -6,8 +6,10 @@ API routes. No execution, no UI beyond what a test can call.
 
 Depends on phase 1. Blocks phases 3, 4 and 5.
 
-**Status: not started.** No table, query, route or test from this phase
-exists. Needs the phase 1 schema first.
+**Status: next.** The tables, indexes and constraints all exist from
+phase 1 — `projects`, `suites`, `sections`, `cases`, `case_fields`, with
+the depth cap and the cascade rules already enforced. What is missing is
+every query, every route and every test.
 
 Done when: a 10k-case tree can be created, searched, moved and paged
 through the API without a single unbounded query.

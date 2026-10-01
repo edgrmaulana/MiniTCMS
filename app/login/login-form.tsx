@@ -3,7 +3,7 @@
 import { useActionState } from "react";
 import { login, type LoginState } from "../auth-actions";
 
-const INITIAL: LoginState = { error: null };
+const INITIAL: LoginState = { error: null, email: "" };
 
 export default function LoginForm() {
   const [state, formAction, pending] = useActionState(login, INITIAL);
@@ -23,6 +23,7 @@ export default function LoginForm() {
           autoFocus
           spellCheck={false}
           placeholder="you@example.com"
+          defaultValue={state.email}
           aria-invalid={state.error ? true : undefined}
           aria-describedby={state.error ? "login-error" : undefined}
           className="field"

@@ -148,6 +148,10 @@ export default function Aurora() {
     if (!canvas) return;
 
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    // The hero is display:none below lg, but React still mounts this and runs
+    // the effect: without the gate a phone holds a WebGL2 context, a rAF loop
+    // and a pointermove listener for a canvas nobody can see.
+    const wideEnough = window.matchMedia("(min-width: 64rem)");
     let stop = () => {};
 
     const start = () => {
@@ -158,13 +162,27 @@ export default function Aurora() {
       const vertexShader = compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER);
       const fragmentShader = compile(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER);
       const program = gl.createProgram();
-      if (!vertexShader || !fragmentShader || !program) return () => {};
+
+      // Every early return below has to clean up after itself: a context
+      // restore re-runs start(), so anything abandoned accumulates.
+      const discard = () => {
+        if (vertexShader) gl.deleteShader(vertexShader);
+        if (fragmentShader) gl.deleteShader(fragmentShader);
+        if (program) gl.deleteProgram(program);
+        return () => {};
+      };
+
+      if (!vertexShader || !fragmentShader || !program) return discard();
 
       gl.attachShader(program, vertexShader);
       gl.attachShader(program, fragmentShader);
       gl.linkProgram(program);
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return () => {};
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return discard();
       gl.useProgram(program);
+
+      // Linked: the program holds what it needs and the shaders can go.
+      gl.deleteShader(vertexShader);
+      gl.deleteShader(fragmentShader);
 
       const buffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -214,7 +232,11 @@ export default function Aurora() {
         draw(8.0);
         const onResize = () => draw(8.0);
         window.addEventListener("resize", onResize);
-        return () => window.removeEventListener("resize", onResize);
+        return () => {
+          window.removeEventListener("resize", onResize);
+          gl.deleteProgram(program);
+          gl.deleteBuffer(buffer);
+        };
       }
 
       let frame = 0;
@@ -243,13 +265,20 @@ export default function Aurora() {
       stop = start();
     };
 
+    const onWidthChange = () => {
+      stop();
+      stop = wideEnough.matches ? start() : () => {};
+    };
+
     canvas.addEventListener("webglcontextlost", onContextLost);
     canvas.addEventListener("webglcontextrestored", onContextRestored);
-    stop = start();
+    wideEnough.addEventListener("change", onWidthChange);
+    if (wideEnough.matches) stop = start();
 
     return () => {
       canvas.removeEventListener("webglcontextlost", onContextLost);
       canvas.removeEventListener("webglcontextrestored", onContextRestored);
+      wideEnough.removeEventListener("change", onWidthChange);
       stop();
     };
   }, []);
