@@ -14,8 +14,8 @@ and *when*; AGENTS.md is the *how*.
 |---|------|-------|--------|
 | 1 | `01-foundation.md` | SQLite layer, schema, constants, test harness | done |
 | 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields | done |
-| 3 | `03-execution.md` | Runs, test execution, pass/fail/retest/blocked, rollups | next |
-| 4 | `04-testrail-migration.md` | TestRail client, field mapping, resumable import, report | not started |
+| 3 | `03-execution.md` | Runs, test execution, pass/fail/retest/blocked, rollups | done |
+| 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | next |
 | 5 | `05-ui.md` | App shell and the five screens that make it usable | partial |
 | 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | partial |
 | 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | not started |

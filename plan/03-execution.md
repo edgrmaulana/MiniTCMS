@@ -7,10 +7,34 @@ each case **passed**, **failed**, **retest** or **blocked**.
 
 Depends on phases 1 and 2.
 
-**Status: not started.** Nothing from this phase exists. The tables do:
-`runs`, `tests`, `results`, `statuses`, `plans`, `milestones`,
-`attachments` all landed in phase 1, with the five built-in statuses
-seeded at TestRail's ids and `tests.status_id` defaulting to untested.
+**Status: done.** Every query, all sixteen routes and 28 new tests. 100
+tests pass. Schema v7 added an index on `tests` and v8 two more on
+`runs` and `results`, each after measuring rather than guessing.
+
+Review found seven defects in the first cut of this phase, all fixed
+here and all with a test: a nested route that ignored the run in its
+own path, a run accepting a suite from another project, a run silently
+built from half a stale case selection, `includeAll` and `caseIds`
+resolving a contradiction instead of refusing it, an upload cap applied
+only after the whole file was in memory, and the two index problems.
+
+| Section | State |
+|---------|-------|
+| 1 Run creation | done |
+| 2 The status set | done |
+| 3 Recording a result | done |
+| 4 Run lifecycle | done |
+| 5 Assignment | done |
+| 6 Rollups | done |
+| 7 Plans and configurations | done — `runs.config` is the text label |
+| 8 Attachments | done — local disk, `ATTACHMENTS_DIR` |
+| 9 API routes | done |
+| 10 Tests | done |
+
+Role checks arrived here ahead of phase 6, but only on the two actions
+that destroy or unlock: deleting a run is `admin`, reopening a closed
+one is `admin` or `lead`. Everything else stays open to any session
+until phase 6 answers the permission model in one go.
 
 Done when: a run can be created from a filtered case set, every test in
 it can be set to any assignable status with one keystroke, the status
@@ -180,6 +204,17 @@ how a failed test reaches the person who will retest it.
   the attachment is written first, then referenced by the result in the
   same request. A failed upload must not leave a result without its
   evidence, so the result insert happens last.
+
+Two known gaps, neither worth code before someone hits them:
+
+- `attachments` is polymorphic and carries no foreign key, so
+  `entity_id` is not checked to exist. An upload against a deleted
+  result leaves a file nobody can reach. A sweep belongs with the
+  storage interface, not scattered through the routes.
+- There is a per-file size cap and no per-user quota. Any signed-in
+  account can fill the disk one 32MB file at a time. A quota needs a
+  number somebody has an opinion about; the cap is the part that stops
+  a single request being the problem.
 
 ## 9. API routes
 
