@@ -1,25 +1,32 @@
 import { cookies, headers } from "next/headers";
 import {
+  deleteExpiredSessions,
   deleteSession,
   findSessionUser,
   getDb,
   insertSession,
   nowSeconds,
-  type SessionUser,
-} from "./db";
+} from "./db.ts";
+import type { SessionUser } from "./format.ts";
 import {
   createSessionToken,
   hashSessionToken,
   SESSION_COOKIE,
   SESSION_TTL_SECONDS,
-} from "./auth";
+} from "./auth.ts";
 
 export async function startSession(userId: number): Promise<void> {
   const { token, tokenHash } = createSessionToken();
   const expiresOn = nowSeconds() + SESSION_TTL_SECONDS;
   const requestHeaders = await headers();
 
-  insertSession(getDb(), {
+  const database = getDb();
+  // Swept here rather than on a schedule: a login is the only moment this
+  // table reliably grows, and it keeps the deployment to one process. Move to
+  // a cron if an instance ever goes months between sign-ins.
+  deleteExpiredSessions(database);
+
+  insertSession(database, {
     tokenHash,
     userId,
     expiresOn,

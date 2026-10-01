@@ -4,15 +4,16 @@
 import { createInterface } from "node:readline";
 import { openDb, createUser, findUserByEmail } from "../lib/db.ts";
 import { hashPassword, isValidEmail, passwordComplaint } from "../lib/auth.ts";
+import { USER_ROLES, isUserRole } from "../lib/format.ts";
 
 const [email, role = "admin"] = process.argv.slice(2);
 
 if (!email || !isValidEmail(email)) {
-  console.error("Usage: node scripts/create-user.mjs <email> [admin|lead|tester]");
+  console.error(`Usage: node scripts/create-user.mjs <email> [${USER_ROLES.join("|")}]`);
   process.exit(1);
 }
-if (!["admin", "lead", "tester"].includes(role)) {
-  console.error(`Unknown role: ${role}`);
+if (!isUserRole(role)) {
+  console.error(`Unknown role: ${role}. Expected one of ${USER_ROLES.join(", ")}.`);
   process.exit(1);
 }
 

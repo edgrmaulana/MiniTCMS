@@ -1,6 +1,10 @@
 import Database from "better-sqlite3";
+import { USER_ROLES, type SessionUser, type UserRole, type UserRow } from "./format.ts";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+
+// Interpolated at module load from a constant, never from a request value.
+const ROLE_VALUES = USER_ROLES.map((role) => `'${role}'`).join(", ");
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -11,7 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY,
   email         TEXT NOT NULL,
   name          TEXT,
-  role          TEXT NOT NULL DEFAULT 'tester',
+  role          TEXT NOT NULL DEFAULT 'tester' CHECK (role IN (${ROLE_VALUES})),
   is_active     INTEGER NOT NULL DEFAULT 1,
   password_hash TEXT,
   created_on    INTEGER NOT NULL,
@@ -38,26 +42,6 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(identifier, attempted_on);
 `;
-
-export type UserRole = "admin" | "lead" | "tester";
-
-export type UserRow = {
-  id: number;
-  email: string;
-  name: string | null;
-  role: UserRole;
-  is_active: number;
-  password_hash: string | null;
-  created_on: number;
-};
-
-export type SessionUser = {
-  userId: number;
-  email: string;
-  name: string | null;
-  role: UserRole;
-  expiresOn: number;
-};
 
 export function openDb(file: string): Database.Database {
   const database = new Database(file);

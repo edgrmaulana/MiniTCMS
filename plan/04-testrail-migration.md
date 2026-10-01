@@ -6,6 +6,11 @@ data. Treat a lost field as a bug of the same severity as a crash.
 Depends on phases 1-3. Blocks nothing — but nothing else matters if this
 is wrong.
 
+**Status: not started.** No client, no mapping, no pipeline. The one
+thing already in place is the shape that makes it replayable: every
+importable table carries `(source, source_id)` with a UNIQUE index, and
+`users` already follows it.
+
 Done when: a real TestRail instance imports twice in a row and the
 second run reports zero inserts, zero updates, zero errors.
 

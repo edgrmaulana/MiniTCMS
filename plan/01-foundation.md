@@ -4,6 +4,19 @@ Goal: one SQLite module that owns the whole schema, one constants module
 that owns every status/priority/type id, and a test harness that gives
 each test a fresh database. Nothing user-facing ships here.
 
+**Status: partial.** Bootstrap and the test harness are done. The schema
+is 4 tables of the 15 below, and `lib/format.ts` holds only the user
+role; the status, priority, type and pagination constants do not exist
+yet.
+
+| Section | State |
+|---------|-------|
+| 1 Database bootstrap | done |
+| 2 Schema | partial - auth tables only, at version 2 |
+| 3 Indexes | partial - the 5 auth indexes |
+| 4 Constants | partial - `USER_ROLES` and the row types only |
+| 5 Test harness | done |
+
 Done when: `npm run test` runs real tests against a temp DB, and
 `npm run build` passes with `lib/db.ts` imported by one smoke route.
 
@@ -16,11 +29,12 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - Single `db.exec(SCHEMA)` block on first open, guarded by a
   `schema_version` table.
 - **Already shipped, out of order:** `lib/db.ts` exists at schema
-  version 1 with `users`, `sessions` and `login_attempts`, because the
+  version 2 with `users`, `sessions` and `login_attempts`, because the
   login page in `06-auth-and-api.md` needed them. This phase extends
-  that file to version 2 with the tables below and bumps
-  `SCHEMA_VERSION`. A mismatched stamp already throws on open, so an old
-  `data.db` fails loud instead of half-working.
+  that file to version 3 with the tables below and bumps
+  `SCHEMA_VERSION`. A mismatched stamp throws on open, so an old
+  `data.db` fails loud instead of half-working. Until the first release
+  there is no migration path: bump the stamp and `rm -f data.db*`.
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
@@ -93,7 +107,9 @@ the hottest read in the product.
 
 ## 4. Constants — `lib/format.ts`
 
-Shared client+server. No DB import.
+Shared client+server. No DB import. **Exists** with `USER_ROLES`,
+`isUserRole`, `UserRow` and `SessionUser`; everything below is still to
+write.
 
 - `RESULT_STATUS`: passed 1, blocked 2, untested 3, retest 4, failed 5.
   TestRail's built-in ids, kept deliberately so phase 4 maps 1:1. Custom

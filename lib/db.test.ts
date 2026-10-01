@@ -15,6 +15,7 @@ import {
   insertSession,
   nowSeconds,
   openDb,
+  SCHEMA_VERSION,
 } from "./db";
 
 let directory: string;
@@ -46,6 +47,24 @@ describe("users", () => {
     seedUser();
     expect(() => seedUser()).toThrow();
     expect(countUsers(database)).toBe(1);
+  });
+});
+
+describe("schema", () => {
+  it("rejects a role outside the allowed set", () => {
+    expect(() =>
+      database
+        .prepare("INSERT INTO users (email, role, created_on) VALUES (?, ?, ?)")
+        .run("rogue@example.com", "Designer", nowSeconds()),
+    ).toThrow(/CHECK/i);
+  });
+
+  it("refuses to open a database stamped at another version", () => {
+    const file = join(directory, "stale.db");
+    const stale = openDb(file);
+    stale.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION - 1);
+    stale.close();
+    expect(() => openDb(file)).toThrow(/schema is version/i);
   });
 });
 

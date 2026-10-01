@@ -5,6 +5,8 @@ tests, append-only results, attachments.
 
 Depends on phases 1 and 2.
 
+**Status: not started.** Nothing from this phase exists.
+
 Done when: a run can be created from a filtered case set, results
 recorded, and run/plan rollups read in one SQL aggregate each.
 

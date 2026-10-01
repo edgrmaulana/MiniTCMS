@@ -3,8 +3,17 @@
 Goal: stop the instance being wide open, and give CI a way to report
 results.
 
-Partly shipped ahead of its phase: **sign-in works today**. Sections 1-4
-below describe what is built; sections 5-7 are the remaining work.
+**Status: partial.** Sign-in works today, ahead of its phase.
+
+| Section | State |
+|---------|-------|
+| 1 Login | done |
+| 2 Login page design | done |
+| 3 Roles | partial - `USER_ROLES` and the column CHECK exist, `requireRole` does not |
+| 4 Imported users | done at the schema level, untested until phase 4 |
+| 5 API keys | not started |
+| 6 CI endpoints | not started |
+| 7 Tests | partial - auth covered, route authorisation not |
 
 Done when: every route requires a session or an API key, and a CI job
 can post results for a run with a single authenticated call.
@@ -63,7 +72,9 @@ from the TestRail import.
 
 - Password change and admin-triggered reset.
 - Session list and "sign out everywhere".
-- `deleteExpiredSessions` exists but nothing calls it on a schedule.
+- Expired sessions are swept on sign-in rather than on a schedule. Good
+  enough while people log in; a cron is the upgrade if an instance ever
+  goes months between sign-ins.
 - `middleware.ts` so new routes are protected by default rather than by
   remembering to call `currentUser()`.
 
@@ -99,7 +110,9 @@ form right, lowercase slash wordmark (`minitcms / test console`).
 
 ## 3. Roles
 
-Three, in `lib/db.ts` as the `UserRole` type:
+Three, in `lib/format.ts` as `USER_ROLES`, and enforced by a
+`CHECK (role IN (...))` on the column so the phase 4 import cannot write
+a fourth one from somebody's custom field:
 
 - `admin` — everything, including import and user management.
 - `lead` — create and close runs, edit cases, no user management.

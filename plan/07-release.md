@@ -5,6 +5,10 @@ without asking a question.
 
 Can overlap phase 6.
 
+**Status: not started.** No Dockerfile, no compose file, no CI workflow,
+no LICENSE. `README.md` exists and covers install, first account and the
+three checks.
+
 Done when: a stranger follows `README.md` on a clean machine and gets a
 running instance with their TestRail data in it.
 

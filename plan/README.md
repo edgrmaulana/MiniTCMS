@@ -10,15 +10,19 @@ and *when*; AGENTS.md is the *how*.
 
 ## Phases
 
-| # | File | Ships |
-|---|------|-------|
-| 1 | `01-foundation.md` | SQLite layer, schema, constants, test harness |
-| 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields |
-| 3 | `03-execution.md` | Milestones, plans, runs, tests, append-only results |
-| 4 | `04-testrail-migration.md` | TestRail client, field mapping, resumable import, report |
-| 5 | `05-ui.md` | App shell and the five screens that make it usable |
-| 6 | `06-auth-and-api.md` | Login (shipped), roles, public REST API, CI reporters |
-| 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 |
+| # | File | Ships | Status |
+|---|------|-------|--------|
+| 1 | `01-foundation.md` | SQLite layer, schema, constants, test harness | partial |
+| 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields | not started |
+| 3 | `03-execution.md` | Milestones, plans, runs, tests, append-only results | not started |
+| 4 | `04-testrail-migration.md` | TestRail client, field mapping, resumable import, report | not started |
+| 5 | `05-ui.md` | App shell and the five screens that make it usable | partial |
+| 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | partial |
+| 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | not started |
+
+Each phase file opens with its own status and a per-section breakdown.
+Update them in the same turn the work lands, or this table starts
+lying.
 
 Phases 1→4 are strictly ordered. Phase 5 can start once phase 2 lands.
 Phase 7 is last.
