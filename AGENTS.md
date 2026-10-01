@@ -84,6 +84,65 @@ are working before writing code.
     customer data in fixtures, docs or seeds. Anything a contributor
     needs to run the project is documented in `README.md` in the same
     turn it becomes necessary.
+16. **Measure before you claim a query is fine.** Any new or changed
+    SQL gets `EXPLAIN QUERY PLAN` run against a table with realistic
+    row counts before the turn ends. `USE TEMP B-TREE FOR ORDER BY` on
+    a paged list means every page sorts the whole filtered set and the
+    index is wrong. Put the measured numbers in the comment above the
+    index, not an adjective.
+17. **Never read a row, change it in TypeScript, and write it back.**
+    Two callers doing that at once lose one of the two edits, and
+    SQLite will not stop them. Let one `UPDATE` do the arithmetic, or
+    put the read and the write in the same `database.transaction`.
+18. **Every bulk write is bounded twice**: chunked so a statement fits
+    inside SQLite's parameter limit, and capped so one request cannot
+    hold a write transaction open over an unbounded list.
+19. **One user action is one transaction.** If a route does two writes,
+    they belong in one function in `lib/db.ts` that wraps both. A
+    rename that survives a rejected move is a half-applied edit the
+    caller cannot see.
+
+---
+
+## Reviewing your own work
+
+Before a turn ends, read the diff back against these three. They are
+not a wish list - every line here is something that was actually
+shipped broken in this repo once.
+
+**Security**
+
+- Is every value parameterised? Interpolation into SQL is allowed only
+  for a placeholder list built from `.length`, or a constant from
+  `lib/format.ts` - never a request value, and never a column name
+  taken from input.
+- Does a `LIKE` pattern escape `%`, `_` and `\`, with `ESCAPE` declared?
+  Unescaped, a search for `%` returns the whole table.
+- Does the route check the session before it does anything else? Does
+  it reject a body that is not `application/json`?
+- Does an error message leak anything the caller should not see? Domain
+  errors are safe to return; anything unexpected is a 500 with a fixed
+  string and the detail in the server log.
+- Does a new write path let a caller touch a row in another project or
+  suite? Scope is checked in `lib/db.ts`, not assumed from the URL.
+
+**Quality**
+
+- Does the same rule exist in two places? A rule in a route is a rule
+  the CLI and the importer do not get.
+- Does a write reject an unknown id, rather than reporting success for
+  having changed nothing?
+- Is the unhappy path tested? A guard with no test that fires is a
+  guard that quietly stops working.
+- Does a comment explain a *why* that the code cannot? Delete the rest.
+
+**Performance**
+
+- `EXPLAIN QUERY PLAN` on every list, every tree read, every count.
+- Is there an index for the `WHERE`, *and* for the `ORDER BY`? The
+  second is the one that gets forgotten.
+- Does the query count rows in SQL, or fetch them and count in JS?
+- Is the work bounded by the page size, or by the size of the table?
 
 ---
 

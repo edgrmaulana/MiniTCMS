@@ -6,10 +6,34 @@ API routes. No execution, no UI beyond what a test can call.
 
 Depends on phase 1. Blocks phases 3, 4 and 5.
 
-**Status: next.** The tables, indexes and constraints all exist from
-phase 1 — `projects`, `suites`, `sections`, `cases`, `case_fields`, with
-the depth cap and the cascade rules already enforced. What is missing is
-every query, every route and every test.
+**Status: done.** Every query, all eleven routes and 21 new tests. 72
+tests pass. Schema v6 widened two indexes on `cases` after measuring
+the queries this phase added.
+
+| Section | State |
+|---------|-------|
+| 1 Queries | done |
+| 2 Case content | done — `custom.steps` is a convention, not a column |
+| 3 Custom fields | done, minus per-project scoping |
+| 4 API routes | done — all eleven, behind a session |
+| 5 Tests | done |
+
+Deferred, deliberately, and neither blocks phase 3:
+
+- **Per-project field scoping** (`configs.context`). Every field is
+  global for now. Nothing has asked for the other case yet, and the
+  shape it should take depends on what the TestRail import actually
+  sends in `configs`.
+- **Role checks on writes.** Every route requires a session; none
+  requires a particular role. Who may create a project rather than a
+  case is a phase 6 question, answered once, for every route at the
+  same time.
+- **Cross-project scope on `milestone_id`.** A case's milestone is
+  checked for existence by the foreign key and nothing more, so a case
+  can point at a milestone in another project. `section_id` is checked
+  against the suite, because that one is reachable today; milestones
+  arrive in phase 3 and the check belongs in the same turn as the
+  screen that can set one.
 
 Done when: a 10k-case tree can be created, searched, moved and paged
 through the API without a single unbounded query.
@@ -23,10 +47,14 @@ separate `COUNT(*)` with the same `WHERE`, not `rows.length`.
 - `listProjects`, `getProject`, `createProject`, `updateProject`.
 - `listSuites(projectId, …)`, suite CRUD.
 - `sectionTree(suiteId)` — one recursive CTE returning
-  `(id, parent_id, depth, name, case_count)` ordered by
-  `(parent_id, display_order)`. One query for the whole tree, never a
-  fetch per level. Cap depth at 6 like TestRail does; reject deeper on
-  insert with a loud error.
+  `(id, parent_id, depth, display_order, name, description,
+  case_count)` in render order. The CTE builds a `sort_path` as it
+  walks, so the rows come back depth-first with siblings in
+  `display_order` and the caller indents by `depth` without sorting
+  again. One query for the whole tree, never a fetch per level. Cap
+  depth at 6 like TestRail does; reject deeper on insert with a loud
+  error. The recursion carries a level bound as well: a `parent_id`
+  cycle would otherwise spin the CTE until the process dies.
 - `moveSection(sectionId, newParentId, newOrder)` — rewrites `depth` for
   the moved subtree in one `UPDATE … WHERE id IN (recursive CTE)`.
   Reject a move into own descendant.
