@@ -116,6 +116,30 @@ export function offsetFor(page: unknown, limit: unknown): number {
   return (clampPage(page) - 1) * clampPageSize(limit);
 }
 
+/*
+  TestRail's custom field types, kept at its own names so the import is a
+  copy. A definition whose type is not in here still imports: the value is
+  preserved verbatim and reported, because losing a field is worse than
+  storing one we cannot render yet.
+*/
+export const CASE_FIELD_TYPES = [
+  "string",
+  "text",
+  "integer",
+  "dropdown",
+  "multiselect",
+  "checkbox",
+  "date",
+  "user",
+  "steps",
+] as const;
+
+export type CaseFieldType = (typeof CASE_FIELD_TYPES)[number];
+
+export function isCaseFieldType(value: string): value is CaseFieldType {
+  return (CASE_FIELD_TYPES as readonly string[]).includes(value);
+}
+
 export type UserRow = {
   id: number;
   email: string;
@@ -232,6 +256,106 @@ export type ResultRow = {
   source: string | null;
   source_id: number | null;
 };
+
+export type CaseFieldRow = {
+  id: number;
+  system_name: string;
+  label: string;
+  type: string;
+  is_global: number;
+  configs: string | null;
+  source: string | null;
+  source_id: number | null;
+};
+
+export class CaseFieldError extends Error {}
+
+/*
+  Validates a `custom` bag against the definitions in `case_fields`. Throws on
+  a value that contradicts its declared type; returns the keys that have no
+  definition rather than throwing, because the two callers want opposite
+  things with them - the API rejects an unknown key, the TestRail import keeps
+  it and reports it (AGENTS.md rule 4).
+*/
+export function validateCustom(
+  definitions: readonly CaseFieldRow[],
+  values: Record<string, unknown>,
+): { custom: Record<string, unknown>; unknownKeys: string[] } {
+  const byName = new Map(definitions.map((definition) => [definition.system_name, definition]));
+  const custom: Record<string, unknown> = {};
+  const unknownKeys: string[] = [];
+
+  for (const [name, value] of Object.entries(values)) {
+    if (value === null || value === undefined) continue;
+    const definition = byName.get(name);
+    if (!definition) {
+      unknownKeys.push(name);
+      custom[name] = value;
+      continue;
+    }
+    custom[name] = coerceFieldValue(definition, value);
+  }
+  return { custom, unknownKeys };
+}
+
+function coerceFieldValue(definition: CaseFieldRow, value: unknown): unknown {
+  const fail = (wanted: string): never => {
+    throw new CaseFieldError(
+      `Field "${definition.system_name}" wants ${wanted}, got ${JSON.stringify(value)}`,
+    );
+  };
+
+  switch (definition.type) {
+    case "string":
+    case "text":
+      return typeof value === "string" ? value : fail("a string");
+    case "integer":
+      return Number.isInteger(value) ? value : fail("an integer");
+    case "checkbox":
+      return typeof value === "boolean" ? value : fail("true or false");
+    case "date":
+      // Unix seconds, same as every other timestamp in the schema.
+      return Number.isInteger(value) ? value : fail("a unix timestamp in seconds");
+    case "user":
+      return Number.isInteger(value) ? value : fail("a user id");
+    case "dropdown": {
+      const allowed = allowedValues(definition);
+      return allowed.includes(String(value)) ? value : fail(`one of ${allowed.join(", ")}`);
+    }
+    case "multiselect": {
+      if (!Array.isArray(value)) return fail("an array");
+      const allowed = allowedValues(definition);
+      for (const entry of value) {
+        if (!allowed.includes(String(entry))) return fail(`values from ${allowed.join(", ")}`);
+      }
+      return value;
+    }
+    case "steps":
+      return Array.isArray(value) ? value : fail("an array of steps");
+    default:
+      // An unsupported type is not a reason to drop the value.
+      return value;
+  }
+}
+
+function allowedValues(definition: CaseFieldRow): string[] {
+  if (!definition.configs) return [];
+  try {
+    const parsed = JSON.parse(definition.configs) as { options?: { items?: unknown } };
+    const items = parsed.options?.items;
+    if (Array.isArray(items)) return items.map(String);
+    // TestRail ships dropdown items as a newline-separated "id, label" blob.
+    if (typeof items === "string") {
+      return items
+        .split("\n")
+        .map((line) => line.split(",")[0].trim())
+        .filter(Boolean);
+    }
+    return [];
+  } catch {
+    throw new CaseFieldError(`Field "${definition.system_name}" has unreadable configs JSON`);
+  }
+}
 
 export type ListResult<Row> = {
   rows: Row[];

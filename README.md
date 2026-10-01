@@ -7,14 +7,15 @@ Next.js 16 + SQLite. One process, one database file, one container.
 
 ## Status
 
-Early. Sign-in works and the data model is complete; the screens that
-use it are not built yet.
+Early. Sign-in works, the data model is complete and the case
+repository is queryable over a REST API; the screens that use it are
+not built yet.
 
 | Phase | | |
 |---|---|---|
 | 1 | Foundation — SQLite layer, schema, constants, test harness | **done** |
-| 2 | Case repository — projects, suites, sections, cases, custom fields | next |
-| 3 | Execution — milestones, plans, runs, append-only results | not started |
+| 2 | Case repository — projects, suites, sections, cases, custom fields | **done** |
+| 3 | Execution — runs, pass/fail/retest/blocked, append-only results | next |
 | 4 | TestRail migration — client, mapping, resumable import, report | not started |
 | 5 | UI — app shell and the five screens | palette and type only |
 | 6 | Auth and public API — login, roles, REST API, CI reporters | login done |
@@ -94,9 +95,37 @@ until an admin sets one; they exist so results attribute correctly.
 What is built and what is not is listed in
 [`plan/06-auth-and-api.md`](plan/06-auth-and-api.md).
 
+## API
+
+Every route needs a session cookie; an anonymous request gets `401`.
+There are no role checks yet — see
+[`plan/02-case-repository.md`](plan/02-case-repository.md).
+
+```text
+GET  POST          /api/projects              ?search=&page=&limit=
+GET  PATCH         /api/projects/[id]
+GET  POST          /api/suites                ?projectId=
+GET  PATCH         /api/suites/[id]
+GET                /api/suites/[id]/sections  the whole tree, one query
+     POST          /api/sections
+     PATCH         /api/sections/[id]         rename and/or move
+GET  POST          /api/cases                 ?suiteId=&sectionId=&typeId=
+                                              &priorityId=&search=&page=&limit=
+GET  PATCH  DELETE /api/cases/[id]            DELETE is a soft delete
+     POST          /api/cases/bulk            move or edit many
+GET  POST          /api/case-fields
+```
+
+Lists return `{ rows, total, page, limit }`, where `total` is the count
+before paging. `limit` snaps to 25, 50 or 100 — an arbitrary value is a
+way to ask for the whole table one request at a time.
+
+A body key the route does not recognise is a `400`, not a shrug: a typo
+in a field name should not look like a save that worked.
+
 ## Data model
 
-Schema version 5: 17 tables, created in one block and guarded by a
+Schema version 6: 17 tables, created in one block and guarded by a
 stamp that is read before anything else is applied.
 
 ```text

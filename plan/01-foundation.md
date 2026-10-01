@@ -4,10 +4,14 @@ Goal: one SQLite module that owns the whole schema, one constants module
 that owns every status/priority/type id, and a test harness that gives
 each test a fresh database. Nothing user-facing ships here.
 
-**Status: done.** Schema version 5: 17 tables, 34 indexes, the five
-built-in statuses seeded. `lib/format.ts` owns the constants. 51 tests
-pass. v5 added `cases.updated_by` — both TestRail entry points carry an
-updating user and there was nowhere to put it.
+**Status: done.** Schema version 6: 17 tables, 34 indexes, the five
+built-in statuses seeded. `lib/format.ts` owns the constants. 72 tests
+pass.
+
+- v5 added `cases.updated_by` — both TestRail entry points carry an
+  updating user and there was nowhere to put it.
+- v6 widened two indexes on `cases` after measuring phase 2's queries
+  against 100k rows. No columns changed.
 
 | Section | State |
 |---------|-------|
@@ -43,7 +47,7 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
-## 2. Schema v5
+## 2. Schema v6
 
 All tables created up front even though phases 2 and 3 fill them — one
 `db.exec`, one review.
@@ -117,8 +121,8 @@ import_runs     id, source, started_on, finished_on, state, cursor JSON,
 CREATE INDEX idx_suites_project    ON suites(project_id);
 CREATE INDEX idx_sections_suite    ON sections(suite_id);
 CREATE INDEX idx_sections_parent   ON sections(parent_id);
-CREATE INDEX idx_cases_section     ON cases(section_id);
-CREATE INDEX idx_cases_suite       ON cases(suite_id);
+CREATE INDEX idx_cases_section     ON cases(section_id, is_deleted);
+CREATE INDEX idx_cases_suite       ON cases(suite_id, is_deleted, section_id, id);
 CREATE INDEX idx_cases_title       ON cases(title);
 CREATE INDEX idx_runs_project      ON runs(project_id);
 CREATE INDEX idx_runs_plan         ON runs(plan_id);
@@ -130,6 +134,20 @@ CREATE INDEX idx_attach_entity     ON attachments(entity_type, entity_id);
 
 `idx_results_test` is the one that matters: "latest result per test" is
 the hottest read in the product.
+
+The two on `cases` are wider than they look like they need to be, and
+both were measured at 100k rows rather than guessed:
+
+- `idx_cases_suite` carries `section_id, id` so it covers `listCases`
+  down to its `ORDER BY`. One column narrower, every page answered with
+  `USE TEMP B-TREE FOR ORDER BY` — sorting all 100k matching rows to
+  return 25. Page 1 went 116ms to 0.2ms, page 1000 40ms to 0.6ms.
+- `idx_cases_section` carries `is_deleted` so `sectionTree`'s count per
+  section is a covering index scan. The tree over 200 sections went
+  207ms to 1.6ms.
+
+A paged list needs an index for its `ORDER BY` as well as its `WHERE`,
+and the second one is the one that gets forgotten.
 
 ## 4. Constants — `lib/format.ts`
 

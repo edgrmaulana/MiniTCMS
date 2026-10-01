@@ -2,16 +2,28 @@ import Database from "better-sqlite3";
 import {
   ATTACHMENT_ENTITIES,
   BUILT_IN_STATUSES,
+  CaseFieldError,
   MAX_SECTION_LEVELS,
   RESULT_STATUS,
   SUITE_MODE,
   USER_ROLES,
+  clampPage,
+  clampPageSize,
+  offsetFor,
+  validateCustom,
+  type CaseFieldRow,
+  type CaseRow,
+  type ListResult,
+  type ProjectRow,
+  type SectionRow,
   type SessionUser,
+  type SuiteMode,
+  type SuiteRow,
   type UserRole,
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -159,8 +171,21 @@ CREATE TABLE IF NOT EXISTS cases (
   source       TEXT,
   source_id    INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_cases_section       ON cases(section_id);
-CREATE INDEX IF NOT EXISTS idx_cases_suite         ON cases(suite_id, is_deleted);
+/*
+  Both of these are wider than they look like they need to be, and both were
+  measured on 100k cases before being widened:
+
+  idx_cases_suite covers listCases down to its ORDER BY. Without the trailing
+  (section_id, id) SQLite answers every page with USE TEMP B-TREE FOR ORDER
+  BY - sorting all 100k matching rows to return 25. Page 1 went 116ms -> 0.2ms,
+  page 1000 40ms -> 0.6ms.
+
+  idx_cases_section carries is_deleted so sectionTree's per-section count is a
+  covering index scan instead of a row fetch per case. The tree over 200
+  sections went 207ms -> 1.6ms.
+*/
+CREATE INDEX IF NOT EXISTS idx_cases_section       ON cases(section_id, is_deleted);
+CREATE INDEX IF NOT EXISTS idx_cases_suite         ON cases(suite_id, is_deleted, section_id, id);
 CREATE INDEX IF NOT EXISTS idx_cases_title         ON cases(title);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_source ON cases(source, source_id);
 
@@ -461,4 +486,759 @@ export function clearLoginAttempts(database: Database.Database, identifier: stri
 
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 2: projects, suites, sections, cases, custom field definitions
+ * ------------------------------------------------------------------ */
+
+export class NotFoundError extends Error {}
+export class ConflictError extends Error {}
+
+export type ListOptions = { search?: string | null; limit?: unknown; page?: unknown };
+
+/*
+  LIKE treats % and _ as wildcards, so a search for "50%" would match far more
+  than the user asked for. Escaped with a backslash, declared by ESCAPE on
+  every LIKE that uses this.
+*/
+function likePattern(search: string): string {
+  const escaped = search.trim().replace(/[\\%_]/g, (character) => `\\${character}`);
+  return `%${escaped}%`;
+}
+
+function paged<Row>(
+  rows: Row[],
+  total: number,
+  options: ListOptions,
+): ListResult<Row> {
+  return { rows, total, page: clampPage(options.page), limit: clampPageSize(options.limit) };
+}
+
+// Writes reject an unknown id rather than silently changing nothing, so a
+// caller never has to compare `changes` to know whether it worked.
+function assertChanged(changes: number, what: string, id: number): void {
+  if (changes === 0) throw new NotFoundError(`No ${what} with id ${id}`);
+}
+
+export function listProjects(
+  database: Database.Database,
+  options: ListOptions = {},
+): ListResult<ProjectRow> {
+  const search = options.search?.trim() ? likePattern(options.search) : null;
+  const where = search ? "WHERE name LIKE ? ESCAPE '\\'" : "";
+  const filter = search ? [search] : [];
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM projects ${where}`).get(...filter) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT id, name, announcement, suite_mode, is_completed, created_on, source, source_id
+         FROM projects ${where}
+        ORDER BY is_completed, name
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...filter, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as ProjectRow[];
+  return paged(rows, total, options);
+}
+
+export function getProject(database: Database.Database, id: number): ProjectRow | undefined {
+  return database.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | undefined;
+}
+
+export function createProject(
+  database: Database.Database,
+  project: { name: string; announcement?: string | null; suiteMode?: SuiteMode },
+): number {
+  const result = database
+    .prepare(
+      `INSERT INTO projects (name, announcement, suite_mode, created_on)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(
+      project.name,
+      project.announcement ?? null,
+      project.suiteMode ?? SUITE_MODE.single,
+      nowSeconds(),
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function updateProject(
+  database: Database.Database,
+  id: number,
+  patch: { name?: string; announcement?: string | null; isCompleted?: boolean },
+): void {
+  const result = database
+    .prepare(
+      `UPDATE projects
+          SET name         = COALESCE(?, name),
+              announcement = CASE WHEN ? THEN ? ELSE announcement END,
+              is_completed = COALESCE(?, is_completed)
+        WHERE id = ?`,
+    )
+    .run(
+      patch.name ?? null,
+      patch.announcement === undefined ? 0 : 1,
+      patch.announcement ?? null,
+      patch.isCompleted === undefined ? null : Number(patch.isCompleted),
+      id,
+    );
+  assertChanged(result.changes, "project", id);
+}
+
+export function listSuites(
+  database: Database.Database,
+  projectId: number,
+  options: ListOptions = {},
+): ListResult<SuiteRow> {
+  const search = options.search?.trim() ? likePattern(options.search) : null;
+  const filter = search ? [projectId, search] : [projectId];
+  const where = `WHERE project_id = ?${search ? " AND name LIKE ? ESCAPE '\\'" : ""}`;
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM suites ${where}`).get(...filter) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT id, project_id, name, description, is_baseline, baseline_of, source, source_id
+         FROM suites ${where}
+        ORDER BY is_baseline, name
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...filter, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as SuiteRow[];
+  return paged(rows, total, options);
+}
+
+export function getSuite(database: Database.Database, id: number): SuiteRow | undefined {
+  return database.prepare("SELECT * FROM suites WHERE id = ?").get(id) as SuiteRow | undefined;
+}
+
+export function createSuite(
+  database: Database.Database,
+  suite: { projectId: number; name: string; description?: string | null },
+): number {
+  const result = database
+    .prepare("INSERT INTO suites (project_id, name, description) VALUES (?, ?, ?)")
+    .run(suite.projectId, suite.name, suite.description ?? null);
+  return Number(result.lastInsertRowid);
+}
+
+export function updateSuite(
+  database: Database.Database,
+  id: number,
+  patch: { name?: string; description?: string | null },
+): void {
+  const result = database
+    .prepare(
+      `UPDATE suites
+          SET name        = COALESCE(?, name),
+              description = CASE WHEN ? THEN ? ELSE description END
+        WHERE id = ?`,
+    )
+    .run(patch.name ?? null, patch.description === undefined ? 0 : 1, patch.description ?? null, id);
+  assertChanged(result.changes, "suite", id);
+}
+
+export type SectionTreeRow = {
+  id: number;
+  parent_id: number | null;
+  depth: number;
+  display_order: number;
+  name: string;
+  description: string | null;
+  case_count: number;
+};
+
+/*
+  The whole tree in one query, in render order. `sort_path` is built as the CTE
+  walks down so the result comes back depth-first with siblings in
+  display_order - the caller indents by `depth` and never sorts again.
+
+  The level bound is not decoration: a parent_id cycle would spin this CTE
+  forever and take the process with it. moveSection rejects cycles, so the
+  bound should never fire; it is there for the day something else writes a
+  parent_id.
+*/
+export function sectionTree(database: Database.Database, suiteId: number): SectionTreeRow[] {
+  return database
+    .prepare(
+      `WITH RECURSIVE tree AS (
+         SELECT id, parent_id, depth, display_order, name, description, 0 AS level,
+                printf('%08d.%08d', display_order, id) AS sort_path
+           FROM sections
+          WHERE suite_id = ? AND parent_id IS NULL
+          UNION ALL
+         SELECT child.id, child.parent_id, child.depth, child.display_order, child.name,
+                child.description, tree.level + 1,
+                tree.sort_path || '/' || printf('%08d.%08d', child.display_order, child.id)
+           FROM sections child
+           JOIN tree ON child.parent_id = tree.id
+          WHERE tree.level + 1 < ?
+       )
+       SELECT tree.id, tree.parent_id, tree.depth, tree.display_order, tree.name, tree.description,
+              (SELECT COUNT(*) FROM cases
+                WHERE cases.section_id = tree.id AND cases.is_deleted = 0) AS case_count
+         FROM tree
+        ORDER BY tree.sort_path`,
+    )
+    .all(suiteId, MAX_SECTION_LEVELS) as SectionTreeRow[];
+}
+
+// A section and everything under it, used by both the cycle check and the
+// depth rewrite in moveSection.
+function subtree(database: Database.Database, sectionId: number): { id: number; depth: number }[] {
+  return database
+    .prepare(
+      `WITH RECURSIVE branch AS (
+         SELECT id, depth, 0 AS level FROM sections WHERE id = ?
+          UNION ALL
+         SELECT child.id, child.depth, branch.level + 1
+           FROM sections child
+           JOIN branch ON child.parent_id = branch.id
+          WHERE branch.level + 1 < ?
+       )
+       SELECT id, depth FROM branch`,
+    )
+    .all(sectionId, MAX_SECTION_LEVELS) as { id: number; depth: number }[];
+}
+
+function requireSection(database: Database.Database, id: number): SectionRow {
+  const section = database.prepare("SELECT * FROM sections WHERE id = ?").get(id) as
+    | SectionRow
+    | undefined;
+  if (!section) throw new NotFoundError(`No section with id ${id}`);
+  return section;
+}
+
+function nextDisplayOrder(
+  database: Database.Database,
+  suiteId: number,
+  parentId: number | null,
+): number {
+  const row = database
+    .prepare(
+      `SELECT COALESCE(MAX(display_order), -1) + 1 AS next
+         FROM sections
+        WHERE suite_id = ? AND parent_id IS ?`,
+    )
+    .get(suiteId, parentId) as { next: number };
+  return row.next;
+}
+
+export function createSection(
+  database: Database.Database,
+  section: {
+    suiteId: number;
+    parentId?: number | null;
+    name: string;
+    description?: string | null;
+    displayOrder?: number;
+  },
+): number {
+  const parentId = section.parentId ?? null;
+  let depth = 0;
+  if (parentId !== null) {
+    const parent = requireSection(database, parentId);
+    if (parent.suite_id !== section.suiteId) {
+      throw new ConflictError(`Section ${parentId} is in another suite`);
+    }
+    depth = parent.depth + 1;
+  }
+  if (depth >= MAX_SECTION_LEVELS) {
+    throw new ConflictError(
+      `Sections nest ${MAX_SECTION_LEVELS} levels deep at most; this one would be level ${depth + 1}`,
+    );
+  }
+  const result = database
+    .prepare(
+      `INSERT INTO sections (suite_id, parent_id, depth, display_order, name, description)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      section.suiteId,
+      parentId,
+      depth,
+      section.displayOrder ?? nextDisplayOrder(database, section.suiteId, parentId),
+      section.name,
+      section.description ?? null,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function updateSection(
+  database: Database.Database,
+  id: number,
+  patch: { name?: string; description?: string | null },
+): void {
+  const result = database
+    .prepare(
+      `UPDATE sections
+          SET name        = COALESCE(?, name),
+              description = CASE WHEN ? THEN ? ELSE description END
+        WHERE id = ?`,
+    )
+    .run(patch.name ?? null, patch.description === undefined ? 0 : 1, patch.description ?? null, id);
+  assertChanged(result.changes, "section", id);
+}
+
+/*
+  Rename and move in one transaction, because the route offers them as one
+  action. Run separately, a move that is rejected after the rename succeeded
+  leaves the section renamed and still in the wrong place - a half-applied
+  edit the caller never asked for and cannot see from the error.
+*/
+export function editSection(
+  database: Database.Database,
+  id: number,
+  patch: {
+    name?: string;
+    description?: string | null;
+    parentId?: number | null;
+    displayOrder?: number;
+  },
+): void {
+  const edit = database.transaction(() => {
+    if (patch.name !== undefined || patch.description !== undefined) {
+      updateSection(database, id, { name: patch.name, description: patch.description });
+    }
+    if (patch.parentId !== undefined) {
+      moveSection(database, id, patch.parentId, patch.displayOrder);
+    }
+  });
+  edit();
+}
+
+/*
+  Moving a section carries its whole subtree, so the depth of every descendant
+  shifts by the same delta - one UPDATE over the subtree, not a walk. The two
+  rejections are the ones that corrupt a tree rather than merely annoy: a move
+  into own descendant orphans the branch from the root, and a move that pushes
+  a deep subtree past the depth cap fails the CHECK halfway through.
+*/
+export function moveSection(
+  database: Database.Database,
+  sectionId: number,
+  newParentId: number | null,
+  newOrder?: number,
+): void {
+  const move = database.transaction(() => {
+    const section = requireSection(database, sectionId);
+    if (newParentId === sectionId) {
+      throw new ConflictError("A section cannot be its own parent");
+    }
+
+    let newDepth = 0;
+    if (newParentId !== null) {
+      const parent = requireSection(database, newParentId);
+      if (parent.suite_id !== section.suite_id) {
+        throw new ConflictError(`Section ${newParentId} is in another suite`);
+      }
+      newDepth = parent.depth + 1;
+    }
+
+    const branch = subtree(database, sectionId);
+    if (newParentId !== null && branch.some((node) => node.id === newParentId)) {
+      throw new ConflictError(`Section ${newParentId} is inside section ${sectionId}`);
+    }
+
+    const delta = newDepth - section.depth;
+    const deepest = Math.max(...branch.map((node) => node.depth));
+    if (deepest + delta >= MAX_SECTION_LEVELS) {
+      throw new ConflictError(
+        `That move would nest sections ${deepest + delta + 1} levels deep; the cap is ${MAX_SECTION_LEVELS}`,
+      );
+    }
+
+    if (delta !== 0) {
+      // The subtree is re-walked in SQL rather than bound as an id list: a
+      // wide suite can hold more sections than SQLite will take parameters,
+      // and this way the cap never enters into it.
+      database
+        .prepare(
+          `UPDATE sections SET depth = depth + ?
+            WHERE id IN (
+              WITH RECURSIVE branch AS (
+                SELECT id, 0 AS level FROM sections WHERE id = ?
+                 UNION ALL
+                SELECT child.id, branch.level + 1
+                  FROM sections child
+                  JOIN branch ON child.parent_id = branch.id
+                 WHERE branch.level + 1 < ?
+              )
+              SELECT id FROM branch
+            )`,
+        )
+        .run(delta, sectionId, MAX_SECTION_LEVELS);
+    }
+    database
+      .prepare("UPDATE sections SET parent_id = ?, display_order = ? WHERE id = ?")
+      .run(
+        newParentId,
+        newOrder ?? nextDisplayOrder(database, section.suite_id, newParentId),
+        sectionId,
+      );
+  });
+  move();
+}
+
+export function listCaseFields(database: Database.Database): CaseFieldRow[] {
+  return database
+    .prepare("SELECT * FROM case_fields ORDER BY label")
+    .all() as CaseFieldRow[];
+}
+
+/*
+  Keyed on system_name, not on an id: a CSV import can only infer
+  `type = 'text'` from a column header, and a later API import has to be able
+  to correct that definition in place rather than create a second one.
+*/
+export function upsertCaseField(
+  database: Database.Database,
+  field: {
+    systemName: string;
+    label: string;
+    type: string;
+    isGlobal?: boolean;
+    configs?: string | null;
+    source?: string | null;
+    sourceId?: number | null;
+  },
+): number {
+  database
+    .prepare(
+      `INSERT INTO case_fields (system_name, label, type, is_global, configs, source, source_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(system_name) DO UPDATE SET
+         label     = excluded.label,
+         type      = excluded.type,
+         is_global = excluded.is_global,
+         configs   = excluded.configs`,
+    )
+    .run(
+      field.systemName,
+      field.label,
+      field.type,
+      field.isGlobal === false ? 0 : 1,
+      field.configs ?? null,
+      field.source ?? null,
+      field.sourceId ?? null,
+    );
+  // Read the id back rather than trusting lastInsertRowid: on the DO UPDATE
+  // branch nothing was inserted and that value is left over from whatever this
+  // connection inserted last, in whatever table.
+  const row = database
+    .prepare("SELECT id FROM case_fields WHERE system_name = ?")
+    .get(field.systemName) as { id: number };
+  return row.id;
+}
+
+export type CaseFilter = ListOptions & {
+  sectionId?: number | null;
+  typeId?: number | null;
+  priorityId?: number | null;
+};
+
+export function listCases(
+  database: Database.Database,
+  suiteId: number,
+  filter: CaseFilter = {},
+): ListResult<CaseRow> {
+  const conditions = ["suite_id = ?", "is_deleted = 0"];
+  const values: unknown[] = [suiteId];
+
+  if (filter.sectionId !== undefined && filter.sectionId !== null) {
+    conditions.push("section_id = ?");
+    values.push(filter.sectionId);
+  }
+  if (filter.typeId !== undefined && filter.typeId !== null) {
+    conditions.push("type_id = ?");
+    values.push(filter.typeId);
+  }
+  if (filter.priorityId !== undefined && filter.priorityId !== null) {
+    conditions.push("priority_id = ?");
+    values.push(filter.priorityId);
+  }
+  if (filter.search?.trim()) {
+    conditions.push("(title LIKE ? ESCAPE '\\' OR refs LIKE ? ESCAPE '\\')");
+    const pattern = likePattern(filter.search);
+    values.push(pattern, pattern);
+  }
+
+  const where = `WHERE ${conditions.join(" AND ")}`;
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM cases ${where}`).get(...values) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(`SELECT * FROM cases ${where} ORDER BY section_id, id LIMIT ? OFFSET ?`)
+    .all(...values, clampPageSize(filter.limit), offsetFor(filter.page, filter.limit)) as CaseRow[];
+  return paged(rows, total, filter);
+}
+
+export function getCase(database: Database.Database, id: number): CaseRow | undefined {
+  return database
+    .prepare("SELECT * FROM cases WHERE id = ? AND is_deleted = 0")
+    .get(id) as CaseRow | undefined;
+}
+
+type CaseInput = {
+  suiteId: number;
+  sectionId?: number | null;
+  title: string;
+  templateId?: number;
+  typeId?: number | null;
+  priorityId?: number | null;
+  refs?: string | null;
+  estimate?: string | null;
+  milestoneId?: number | null;
+  custom?: Record<string, unknown>;
+  createdBy?: number | null;
+  // The TestRail import keeps a value whose field it has no definition for
+  // and reports it (AGENTS.md rule 4); the API rejects it as a typo.
+  allowUnknownCustom?: boolean;
+};
+
+function serialiseCustom(
+  database: Database.Database,
+  values: Record<string, unknown> | undefined,
+  allowUnknown: boolean,
+): string | null {
+  if (!values || Object.keys(values).length === 0) return null;
+  const { custom, unknownKeys } = validateCustom(listCaseFields(database), values);
+  if (unknownKeys.length > 0 && !allowUnknown) {
+    throw new CaseFieldError(`No such custom field: ${unknownKeys.join(", ")}`);
+  }
+  return JSON.stringify(custom);
+}
+
+function assertSectionInSuite(
+  database: Database.Database,
+  sectionId: number | null | undefined,
+  suiteId: number,
+): void {
+  if (sectionId === null || sectionId === undefined) return;
+  const section = requireSection(database, sectionId);
+  if (section.suite_id !== suiteId) {
+    throw new ConflictError(`Section ${sectionId} is in another suite`);
+  }
+}
+
+export function createCase(database: Database.Database, input: CaseInput): number {
+  assertSectionInSuite(database, input.sectionId, input.suiteId);
+  const custom = serialiseCustom(database, input.custom, input.allowUnknownCustom === true);
+  const timestamp = nowSeconds();
+  const result = database
+    .prepare(
+      `INSERT INTO cases (section_id, suite_id, title, template_id, type_id, priority_id,
+                          refs, estimate, milestone_id, custom,
+                          created_by, created_on, updated_by, updated_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.sectionId ?? null,
+      input.suiteId,
+      input.title,
+      input.templateId ?? 1,
+      input.typeId ?? null,
+      input.priorityId ?? null,
+      input.refs ?? null,
+      input.estimate ?? null,
+      input.milestoneId ?? null,
+      custom,
+      input.createdBy ?? null,
+      timestamp,
+      input.createdBy ?? null,
+      timestamp,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export type CasePatch = {
+  sectionId?: number | null;
+  title?: string;
+  templateId?: number;
+  typeId?: number | null;
+  priorityId?: number | null;
+  refs?: string | null;
+  estimate?: string | null;
+  milestoneId?: number | null;
+  custom?: Record<string, unknown>;
+  allowUnknownCustom?: boolean;
+};
+
+/*
+  `custom` replaces the whole bag rather than merging into it. Merging would
+  make deleting a value impossible through this API, and a half-updated bag is
+  harder to reason about than one the caller sent complete.
+*/
+export function updateCase(
+  database: Database.Database,
+  id: number,
+  patch: CasePatch,
+  updatedBy: number | null,
+): void {
+  const existing = getCase(database, id);
+  if (!existing) throw new NotFoundError(`No case with id ${id}`);
+  if (patch.sectionId !== undefined) {
+    assertSectionInSuite(database, patch.sectionId, existing.suite_id);
+  }
+  /*
+    An untouched `custom` is left alone by the UPDATE rather than read here
+    and written back. Writing it back would make a concurrent edit to another
+    field quietly revert whatever that edit did to the bag, and this function
+    cannot hold a read lock across its own statement.
+  */
+  const custom =
+    patch.custom === undefined
+      ? null
+      : serialiseCustom(database, patch.custom, patch.allowUnknownCustom === true);
+
+  database
+    .prepare(
+      `UPDATE cases
+          SET section_id   = CASE WHEN ? THEN ? ELSE section_id END,
+              title        = COALESCE(?, title),
+              template_id  = COALESCE(?, template_id),
+              type_id      = CASE WHEN ? THEN ? ELSE type_id END,
+              priority_id  = CASE WHEN ? THEN ? ELSE priority_id END,
+              refs         = CASE WHEN ? THEN ? ELSE refs END,
+              estimate     = CASE WHEN ? THEN ? ELSE estimate END,
+              milestone_id = CASE WHEN ? THEN ? ELSE milestone_id END,
+              custom       = CASE WHEN ? THEN ? ELSE custom END,
+              updated_by   = ?,
+              updated_on   = ?
+        WHERE id = ?`,
+    )
+    .run(
+      patch.sectionId === undefined ? 0 : 1,
+      patch.sectionId ?? null,
+      patch.title ?? null,
+      patch.templateId ?? null,
+      patch.typeId === undefined ? 0 : 1,
+      patch.typeId ?? null,
+      patch.priorityId === undefined ? 0 : 1,
+      patch.priorityId ?? null,
+      patch.refs === undefined ? 0 : 1,
+      patch.refs ?? null,
+      patch.estimate === undefined ? 0 : 1,
+      patch.estimate ?? null,
+      patch.milestoneId === undefined ? 0 : 1,
+      patch.milestoneId ?? null,
+      patch.custom === undefined ? 0 : 1,
+      custom,
+      updatedBy,
+      nowSeconds(),
+      id,
+    );
+}
+
+// Soft: a hard delete would take the run history with it through
+// tests.case_id, and a test that lost its case is still a thing that happened.
+export function deleteCase(
+  database: Database.Database,
+  id: number,
+  deletedBy: number | null,
+): void {
+  const result = database
+    .prepare(
+      "UPDATE cases SET is_deleted = 1, updated_by = ?, updated_on = ? WHERE id = ? AND is_deleted = 0",
+    )
+    .run(deletedBy, nowSeconds(), id);
+  assertChanged(result.changes, "case", id);
+}
+
+// SQLite's default parameter ceiling is 999, so an IN list of ids has to be
+// chunked whatever the caller hands over. Phase 4 hands over tens of thousands.
+const BULK_CHUNK = 500;
+
+/*
+  An upper bound on one request, separate from the chunk size. SQLite will
+  take 32766 parameters, so chunking alone does not stop a caller sending a
+  million ids and holding a write transaction open while they are applied.
+  Phase 4 imports in batches of its own and never needs more than this.
+*/
+export const MAX_BULK_IDS = 10_000;
+
+function assertBulkSize(caseIds: readonly number[]): void {
+  if (caseIds.length > MAX_BULK_IDS) {
+    throw new ConflictError(`At most ${MAX_BULK_IDS} ids in one call, got ${caseIds.length}`);
+  }
+}
+
+function chunked<Item>(items: readonly Item[]): Item[][] {
+  const chunks: Item[][] = [];
+  for (let start = 0; start < items.length; start += BULK_CHUNK) {
+    chunks.push(items.slice(start, start + BULK_CHUNK));
+  }
+  return chunks;
+}
+
+export function bulkMoveCases(
+  database: Database.Database,
+  caseIds: readonly number[],
+  sectionId: number,
+  updatedBy: number | null,
+): number {
+  assertBulkSize(caseIds);
+  const section = requireSection(database, sectionId);
+  const move = database.transaction(() => {
+    let moved = 0;
+    for (const chunk of chunked(caseIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = database
+        .prepare(
+          `UPDATE cases
+              SET section_id = ?, updated_by = ?, updated_on = ?
+            WHERE id IN (${placeholders}) AND suite_id = ? AND is_deleted = 0`,
+        )
+        .run(sectionId, updatedBy, nowSeconds(), ...chunk, section.suite_id);
+      moved += result.changes;
+    }
+    return moved;
+  });
+  return move();
+}
+
+export function bulkUpdateCases(
+  database: Database.Database,
+  caseIds: readonly number[],
+  patch: { typeId?: number | null; priorityId?: number | null; milestoneId?: number | null },
+  updatedBy: number | null,
+): number {
+  assertBulkSize(caseIds);
+  const update = database.transaction(() => {
+    let changed = 0;
+    for (const chunk of chunked(caseIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = database
+        .prepare(
+          `UPDATE cases
+              SET type_id      = CASE WHEN ? THEN ? ELSE type_id END,
+                  priority_id  = CASE WHEN ? THEN ? ELSE priority_id END,
+                  milestone_id = CASE WHEN ? THEN ? ELSE milestone_id END,
+                  updated_by   = ?,
+                  updated_on   = ?
+            WHERE id IN (${placeholders}) AND is_deleted = 0`,
+        )
+        .run(
+          patch.typeId === undefined ? 0 : 1,
+          patch.typeId ?? null,
+          patch.priorityId === undefined ? 0 : 1,
+          patch.priorityId ?? null,
+          patch.milestoneId === undefined ? 0 : 1,
+          patch.milestoneId ?? null,
+          updatedBy,
+          nowSeconds(),
+          ...chunk,
+        );
+      changed += result.changes;
+    }
+    return changed;
+  });
+  return update();
 }
