@@ -1,5 +1,6 @@
 import { currentUser } from "@/lib/session";
-import { CaseFieldError, type SessionUser } from "@/lib/format";
+import { CaseFieldError, type SessionUser, type UserRole } from "@/lib/format";
+import { AttachmentTooLargeError } from "@/lib/attachments";
 import { ConflictError, MAX_BULK_IDS, NotFoundError } from "@/lib/db";
 
 /*
@@ -21,6 +22,22 @@ export async function requireUser(): Promise<SessionUser> {
   return user;
 }
 
+export class ForbiddenError extends Error {}
+
+/*
+  The only role check in the product so far, and it guards the only route
+  that destroys data. Everything else is open to any session until phase 6
+  decides the whole permission model at once - one decision for every route
+  rather than a guess per route.
+*/
+export async function requireRole(...roles: readonly UserRole[]): Promise<SessionUser> {
+  const user = await requireUser();
+  if (!roles.includes(user.role)) {
+    throw new ForbiddenError(`This needs the ${roles.join(" or ")} role`);
+  }
+  return user;
+}
+
 /*
   One place that turns a thrown domain error into a status code, so a handler
   never has to remember which of these maps to 404 and which to 409, and an
@@ -31,6 +48,8 @@ export async function handle(work: () => Promise<Response>): Promise<Response> {
     return await work();
   } catch (error) {
     if (error instanceof UnauthorisedError) return problem(401, "Sign in first");
+    if (error instanceof ForbiddenError) return problem(403, error.message);
+    if (error instanceof AttachmentTooLargeError) return problem(413, error.message);
     if (error instanceof NotFoundError) return problem(404, error.message);
     if (error instanceof ConflictError) return problem(409, error.message);
     if (error instanceof BadRequestError) return problem(400, error.message);
@@ -134,6 +153,27 @@ export function customFrom(value: unknown): Record<string, unknown> | undefined 
     throw new BadRequestError("custom must be an object");
   }
   return value as Record<string, unknown>;
+}
+
+/*
+  A comma-separated id list in the query string, so "everything not passed"
+  is one request rather than one per status. Bounded like every other list
+  the caller controls the length of: this one ends up as an IN clause, and
+  SQLite stops binding parameters at 32766.
+*/
+const MAX_QUERY_IDS = 100;
+
+export function idListParam(url: URL, name: string): number[] | undefined {
+  const raw = url.searchParams.get(name);
+  if (raw === null) return undefined;
+  const entries = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (entries.length > MAX_QUERY_IDS) {
+    throw new BadRequestError(`${name} takes at most ${MAX_QUERY_IDS} ids`);
+  }
+  return entries.map((entry) => routeId(entry));
 }
 
 export function listOptionsFrom(url: URL) {

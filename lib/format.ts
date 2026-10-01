@@ -80,6 +80,13 @@ export const CASE_TEMPLATE = {
 */
 export const MAX_SECTION_LEVELS = 6;
 
+/*
+  Milestones nest too, and the recursive rollup over them needs the same
+  bound for the same reason: a parent_id cycle would otherwise spin the CTE
+  until the process dies. Not a product limit anybody will hit - a guard.
+*/
+export const MAX_MILESTONE_LEVELS = 10;
+
 // What an attachment can hang off. Interpolated into the CHECK in lib/db.ts.
 export const ATTACHMENT_ENTITIES = ["case", "test", "result"] as const;
 
@@ -356,6 +363,146 @@ function allowedValues(definition: CaseFieldRow): string[] {
     throw new CaseFieldError(`Field "${definition.system_name}" has unreadable configs JSON`);
   }
 }
+
+export type StatusRow = {
+  id: number;
+  system_name: string;
+  label: string;
+  color: string | null;
+  is_untested: number;
+  is_final: number;
+};
+
+/*
+  Untested is the absence of a result, not a result: it is what a test is born
+  with when a run is created, and it is never written to `results`. Everything
+  else can be recorded, including the custom statuses a TestRail import brings
+  in at id 6 and up - which is why this asks the row rather than comparing
+  against a list of four ids.
+*/
+export function isAssignableStatus(status: StatusRow): boolean {
+  return status.is_untested === 0;
+}
+
+export type StatusCount = { status_id: number; total: number };
+
+export type RunProgress = {
+  counts: StatusCount[];
+  total: number;
+  executed: number;
+  untested: number;
+  passed: number;
+  passRate: number | null;
+};
+
+/*
+  One definition of a pass rate for the whole product: passed over the tests
+  that reached a final status. Untested and retest are excluded from the
+  denominator, and `untested` comes back alongside so no screen can render the
+  percentage on its own. A run that is 2% executed and 100% passing reading as
+  "100%" is the most common way a test report lies.
+
+  Null rather than zero when nothing has been executed: zero percent passing
+  and nothing run yet are different facts.
+*/
+export function runProgress(counts: StatusCount[], statuses: StatusRow[]): RunProgress {
+  const byId = new Map(statuses.map((status) => [status.id, status]));
+  let total = 0;
+  let executed = 0;
+  let untested = 0;
+  let passed = 0;
+
+  for (const count of counts) {
+    const status = byId.get(count.status_id);
+    total += count.total;
+    if (!status) continue;
+    if (status.is_untested === 1) untested += count.total;
+    if (status.is_final === 1) executed += count.total;
+    if (count.status_id === RESULT_STATUS.passed) passed += count.total;
+  }
+  return {
+    counts,
+    total,
+    executed,
+    untested,
+    passed,
+    passRate: executed === 0 ? null : passed / executed,
+  };
+}
+
+/*
+  TestRail writes elapsed time as "1m 45s" and we store that string verbatim,
+  because rewriting a user's value during an import is how data gets mangled.
+  Parsing is a display concern, and it lives here so a total on a screen and a
+  total in a report cannot disagree. Unparseable input is null, not zero: a
+  value we failed to read must not quietly count as no time at all.
+*/
+const ELAPSED_UNITS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
+export function parseElapsed(elapsed: string | null | undefined): number | null {
+  if (!elapsed) return null;
+  const parts = elapsed.trim().toLowerCase().match(/\d+\s*[smhd]/g);
+  if (!parts) return null;
+  let seconds = 0;
+  for (const part of parts) {
+    const amount = Number.parseInt(part, 10);
+    const unit = part.trim().slice(-1);
+    seconds += amount * ELAPSED_UNITS[unit];
+  }
+  return seconds;
+}
+
+export function formatElapsed(seconds: number | null): string | null {
+  if (seconds === null || seconds <= 0) return null;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return [
+    hours > 0 ? `${hours}h` : null,
+    minutes > 0 ? `${minutes}m` : null,
+    remainder > 0 ? `${remainder}s` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+export type MilestoneRow = {
+  id: number;
+  project_id: number;
+  parent_id: number | null;
+  name: string;
+  description: string | null;
+  due_on: number | null;
+  started_on: number | null;
+  is_completed: number;
+  source: string | null;
+  source_id: number | null;
+};
+
+export type PlanRow = {
+  id: number;
+  project_id: number;
+  name: string;
+  description: string | null;
+  milestone_id: number | null;
+  is_completed: number;
+  created_on: number;
+  source: string | null;
+  source_id: number | null;
+};
+
+export type AttachmentRow = {
+  id: number;
+  entity_type: AttachmentEntity;
+  entity_id: number;
+  filename: string;
+  mime: string | null;
+  size: number | null;
+  storage_path: string;
+  created_on: number;
+  source: string | null;
+  source_id: number | null;
+};
 
 export type ListResult<Row> = {
   rows: Row[];

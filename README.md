@@ -7,16 +7,17 @@ Next.js 16 + SQLite. One process, one database file, one container.
 
 ## Status
 
-Early. Sign-in works, the data model is complete and the case
-repository is queryable over a REST API; the screens that use it are
-not built yet.
+Early but usable over the API: sign in, build a case tree, create a run
+from it and record pass, fail, retest or blocked against every test.
+The screens are not built yet, so today that means curl or a CI
+reporter.
 
 | Phase | | |
 |---|---|---|
 | 1 | Foundation — SQLite layer, schema, constants, test harness | **done** |
 | 2 | Case repository — projects, suites, sections, cases, custom fields | **done** |
-| 3 | Execution — runs, pass/fail/retest/blocked, append-only results | next |
-| 4 | TestRail migration — client, mapping, resumable import, report | not started |
+| 3 | Execution — runs, pass/fail/retest/blocked, append-only results | **done** |
+| 4 | TestRail migration — client, CSV reader, mapping, resumable import | next |
 | 5 | UI — app shell and the five screens | palette and type only |
 | 6 | Auth and public API — login, roles, REST API, CI reporters | login done |
 | 7 | Release — Docker, CI, license, contributor docs | not started |
@@ -53,6 +54,8 @@ version moves, an older database is refused on open, untouched — delete
 | Variable | Default | What it does |
 |---|---|---|
 | `SQLITE_FILE` | `./data.db` | Database path |
+| `ATTACHMENTS_DIR` | `./data/attachments` | Where uploaded files are written |
+| `MAX_ATTACHMENT_BYTES` | `33554432` | Upload size cap, 32MB |
 | `TRUSTED_PROXY_HOPS` | `0` | How many reverse proxies you run in front of the app |
 | `TESTRAIL_HOST` | — | e.g. `https://example.testrail.io` (phase 4) |
 | `TESTRAIL_USER` | — | TestRail account email (phase 4) |
@@ -114,6 +117,22 @@ GET  POST          /api/cases                 ?suiteId=&sectionId=&typeId=
 GET  PATCH  DELETE /api/cases/[id]            DELETE is a soft delete
      POST          /api/cases/bulk            move or edit many
 GET  POST          /api/case-fields
+
+GET  POST          /api/milestones            ?projectId=
+GET  PATCH         /api/milestones/[id]
+GET  POST          /api/plans                 ?projectId=
+GET  PATCH         /api/plans/[id]
+GET  POST          /api/runs                  ?projectId=&planId=
+GET  PATCH  DELETE /api/runs/[id]             PATCH closes and reopens
+GET                /api/runs/[id]/summary
+GET                /api/runs/[id]/tests       ?status=1,5&assignedTo=&page=
+     POST          /api/runs/[id]/tests/status   set many at once
+     POST          /api/runs/[id]/tests/assign
+GET                /api/statuses
+     POST          /api/results               one result or a CI run's worth
+GET                /api/tests/[id]/results    the change log, newest first
+     POST          /api/attachments           multipart/form-data
+GET                /api/attachments/[id]
 ```
 
 Lists return `{ rows, total, page, limit }`, where `total` is the count
@@ -123,9 +142,37 @@ way to ask for the whole table one request at a time.
 A body key the route does not recognise is a `400`, not a shrug: a typo
 in a field name should not look like a save that worked.
 
+## Running tests
+
+A run is a snapshot. Creating one copies the suite's cases into `tests`
+and copies each title with them, so editing or deleting a case later
+never rewrites what a past run said it covered.
+
+- Four statuses can be recorded: **passed**, **failed**, **retest**,
+  **blocked**. **Untested** is the absence of a result — it is what a
+  test is born with, and it can never be written.
+- There is no state machine. failed to passed to failed in one
+  afternoon is three true facts about three moments, and all three are
+  kept.
+- Results are append-only. No edit, no delete, no route for either. A
+  correction is a new result and the wrong one stays in history.
+- Failed and blocked need a comment. Enforced in the database layer, so
+  a CI reporter cannot skip it either.
+- Closing a run locks it: every result write is refused until somebody
+  with the lead or admin role reopens it. Reopening destroys nothing.
+- Deleting a run destroys every result in it, so it is admin-only and
+  the response says how many were lost.
+- A pass rate is always `passed / executed`, never over the whole run,
+  and always comes back with its untested count. A run 2% executed and
+  100% passing must not read as "100%".
+
+Custom statuses from a TestRail import work everywhere the built-in
+five do — the UI reads `/api/statuses` rather than assuming there are
+five.
+
 ## Data model
 
-Schema version 6: 17 tables, created in one block and guarded by a
+Schema version 8: 17 tables, created in one block and guarded by a
 stamp that is read before anything else is applied.
 
 ```text

@@ -4,14 +4,18 @@ Goal: one SQLite module that owns the whole schema, one constants module
 that owns every status/priority/type id, and a test harness that gives
 each test a fresh database. Nothing user-facing ships here.
 
-**Status: done.** Schema version 6: 17 tables, 34 indexes, the five
-built-in statuses seeded. `lib/format.ts` owns the constants. 72 tests
+**Status: done.** Schema version 8: 17 tables, 36 indexes, the five
+built-in statuses seeded. `lib/format.ts` owns the constants. 100 tests
 pass.
 
 - v5 added `cases.updated_by` — both TestRail entry points carry an
   updating user and there was nowhere to put it.
 - v6 widened two indexes on `cases` after measuring phase 2's queries
   against 100k rows. No columns changed.
+- v7 added `idx_tests_order` for the same reason, measured against a
+  100k-test run. No columns changed.
+- v8 added `idx_runs_milestone` and widened `idx_results_test`, both
+  from reviewing phase 3 against measurements. No columns changed.
 
 | Section | State |
 |---------|-------|
@@ -47,7 +51,7 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
-## 2. Schema v6
+## 2. Schema v8
 
 All tables created up front even though phases 2 and 3 fill them — one
 `db.exec`, one review.
@@ -126,9 +130,11 @@ CREATE INDEX idx_cases_suite       ON cases(suite_id, is_deleted, section_id, id
 CREATE INDEX idx_cases_title       ON cases(title);
 CREATE INDEX idx_runs_project      ON runs(project_id);
 CREATE INDEX idx_runs_plan         ON runs(plan_id);
-CREATE INDEX idx_tests_run         ON tests(run_id);
+CREATE INDEX idx_runs_milestone    ON runs(milestone_id);
+CREATE INDEX idx_tests_run         ON tests(run_id, status_id);
+CREATE INDEX idx_tests_order       ON tests(run_id, id);
 CREATE INDEX idx_tests_case        ON tests(case_id);
-CREATE INDEX idx_results_test      ON results(test_id, created_on DESC);
+CREATE INDEX idx_results_test      ON results(test_id, created_on DESC, id DESC);
 CREATE INDEX idx_attach_entity     ON attachments(entity_type, entity_id);
 ```
 
@@ -145,6 +151,14 @@ both were measured at 100k rows rather than guessed:
 - `idx_cases_section` carries `is_deleted` so `sectionTree`'s count per
   section is a covering index scan. The tree over 200 sections went
   207ms to 1.6ms.
+- `idx_runs_milestone` keeps the milestone rollup off the `tests` table.
+  Without it the planner inverts the join and scans every test in the
+  database to count the three in one milestone: 2.05ms to 0.10ms, and
+  the difference grows with the table.
+- `idx_results_test` carries `id DESC` because every result written by
+  one `setStatusBulk` shares a timestamp, so `created_on` alone leaves
+  their order undefined. The tiebreak is needed; without the third
+  column it costs a temp B-tree on every history read.
 
 A paged list needs an index for its `ORDER BY` as well as its `WHERE`,
 and the second one is the one that gets forgotten.

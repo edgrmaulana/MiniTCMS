@@ -45,6 +45,9 @@ data.db
 data.db-wal
 data.db-shm
 
+# uploaded attachments (ATTACHMENTS_DIR, default ./data/attachments)
+/data/
+
 # IDE
 .idea/
 *.iml

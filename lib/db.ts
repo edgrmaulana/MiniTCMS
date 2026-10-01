@@ -3,19 +3,30 @@ import {
   ATTACHMENT_ENTITIES,
   BUILT_IN_STATUSES,
   CaseFieldError,
+  MAX_MILESTONE_LEVELS,
   MAX_SECTION_LEVELS,
   RESULT_STATUS,
   SUITE_MODE,
   USER_ROLES,
   clampPage,
   clampPageSize,
+  isAssignableStatus,
   offsetFor,
   validateCustom,
+  type AttachmentEntity,
+  type AttachmentRow,
   type CaseFieldRow,
   type CaseRow,
   type ListResult,
+  type MilestoneRow,
+  type PlanRow,
   type ProjectRow,
+  type ResultRow,
+  type RunRow,
   type SectionRow,
+  type StatusCount,
+  type StatusRow,
+  type TestRow,
   type SessionUser,
   type SuiteMode,
   type SuiteRow,
@@ -23,7 +34,7 @@ import {
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 8;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -220,6 +231,12 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project       ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_plan          ON runs(plan_id);
+/*
+  Without this the milestone rollup inverts its join and scans the whole tests
+  table - 2.05ms for a milestone holding three tests, growing with the
+  database rather than with the milestone. With it, 0.10ms and flat.
+*/
+CREATE INDEX IF NOT EXISTS idx_runs_milestone     ON runs(milestone_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_source ON runs(source, source_id);
 
 CREATE TABLE IF NOT EXISTS tests (
@@ -232,7 +249,24 @@ CREATE TABLE IF NOT EXISTS tests (
   source         TEXT,
   source_id      INTEGER
 );
+/*
+  Two indexes on the same leading column, and both earn their place - measured
+  on a 100k-test run:
+
+  idx_tests_run answers runSummary from the index alone, and is what the
+  planner picks when a status filter is selective enough to seek on.
+
+  idx_tests_order serves the run detail screen's default view, which is
+  ordered by id. Without it that list came back through USE TEMP B-TREE FOR
+  ORDER BY at 90ms a page, and page 2000 at 35ms; with it, 0.05ms and 0.88ms.
+
+  Deliberately no ANALYZE anywhere in this file. With stats collected the
+  planner switches a rare-status filter from an index seek to a full scan and
+  that query goes 0.11ms -> 3.92ms. The no-stats heuristics are the better
+  ones here, and they are what ships.
+*/
 CREATE INDEX IF NOT EXISTS idx_tests_run           ON tests(run_id, status_id);
+CREATE INDEX IF NOT EXISTS idx_tests_order         ON tests(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_tests_case          ON tests(case_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tests_source ON tests(source, source_id);
 
@@ -251,7 +285,13 @@ CREATE TABLE IF NOT EXISTS results (
   source      TEXT,
   source_id   INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_results_test          ON results(test_id, created_on DESC);
+/*
+  The id is part of the index, not just the ORDER BY: results written by one
+  setStatusBulk all share a timestamp, so created_on alone leaves their order
+  undefined. Without the third column that tiebreak costs a temp B-tree on
+  every history read.
+*/
+CREATE INDEX IF NOT EXISTS idx_results_test          ON results(test_id, created_on DESC, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_results_source ON results(source, source_id);
 
 CREATE TABLE IF NOT EXISTS attachments (
@@ -1241,4 +1281,782 @@ export function bulkUpdateCases(
     return changed;
   });
   return update();
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3: milestones, plans, runs, tests, append-only results
+ * ------------------------------------------------------------------ */
+
+export function listStatuses(database: Database.Database): StatusRow[] {
+  return database
+    .prepare("SELECT id, system_name, label, color, is_untested, is_final FROM statuses ORDER BY id")
+    .all() as StatusRow[];
+}
+
+export function listMilestones(
+  database: Database.Database,
+  projectId: number,
+  options: ListOptions = {},
+): ListResult<MilestoneRow> {
+  const total = (
+    database
+      .prepare("SELECT COUNT(*) AS total FROM milestones WHERE project_id = ?")
+      .get(projectId) as { total: number }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT * FROM milestones WHERE project_id = ?
+        ORDER BY is_completed, COALESCE(due_on, 1 << 40), id
+        LIMIT ? OFFSET ?`,
+    )
+    .all(projectId, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as MilestoneRow[];
+  return paged(rows, total, options);
+}
+
+export function getMilestone(database: Database.Database, id: number): MilestoneRow | undefined {
+  return database.prepare("SELECT * FROM milestones WHERE id = ?").get(id) as
+    | MilestoneRow
+    | undefined;
+}
+
+export function createMilestone(
+  database: Database.Database,
+  milestone: {
+    projectId: number;
+    parentId?: number | null;
+    name: string;
+    description?: string | null;
+    dueOn?: number | null;
+    startedOn?: number | null;
+  },
+): number {
+  if (milestone.parentId !== undefined && milestone.parentId !== null) {
+    const parent = getMilestone(database, milestone.parentId);
+    if (!parent) throw new NotFoundError(`No milestone with id ${milestone.parentId}`);
+    if (parent.project_id !== milestone.projectId) {
+      throw new ConflictError(`Milestone ${milestone.parentId} is in another project`);
+    }
+  }
+  const result = database
+    .prepare(
+      `INSERT INTO milestones (project_id, parent_id, name, description, due_on, started_on)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      milestone.projectId,
+      milestone.parentId ?? null,
+      milestone.name,
+      milestone.description ?? null,
+      milestone.dueOn ?? null,
+      milestone.startedOn ?? null,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function updateMilestone(
+  database: Database.Database,
+  id: number,
+  patch: {
+    name?: string;
+    description?: string | null;
+    dueOn?: number | null;
+    startedOn?: number | null;
+    isCompleted?: boolean;
+  },
+): void {
+  const result = database
+    .prepare(
+      `UPDATE milestones
+          SET name         = COALESCE(?, name),
+              description  = CASE WHEN ? THEN ? ELSE description END,
+              due_on       = CASE WHEN ? THEN ? ELSE due_on END,
+              started_on   = CASE WHEN ? THEN ? ELSE started_on END,
+              is_completed = COALESCE(?, is_completed)
+        WHERE id = ?`,
+    )
+    .run(
+      patch.name ?? null,
+      patch.description === undefined ? 0 : 1,
+      patch.description ?? null,
+      patch.dueOn === undefined ? 0 : 1,
+      patch.dueOn ?? null,
+      patch.startedOn === undefined ? 0 : 1,
+      patch.startedOn ?? null,
+      patch.isCompleted === undefined ? null : Number(patch.isCompleted),
+      id,
+    );
+  assertChanged(result.changes, "milestone", id);
+}
+
+export function listPlans(
+  database: Database.Database,
+  projectId: number,
+  options: ListOptions = {},
+): ListResult<PlanRow> {
+  const total = (
+    database.prepare("SELECT COUNT(*) AS total FROM plans WHERE project_id = ?").get(projectId) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT * FROM plans WHERE project_id = ?
+        ORDER BY is_completed, created_on DESC, id DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(projectId, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as PlanRow[];
+  return paged(rows, total, options);
+}
+
+export function getPlan(database: Database.Database, id: number): PlanRow | undefined {
+  return database.prepare("SELECT * FROM plans WHERE id = ?").get(id) as PlanRow | undefined;
+}
+
+function assertMilestoneInProject(
+  database: Database.Database,
+  milestoneId: number,
+  projectId: number,
+): void {
+  const milestone = getMilestone(database, milestoneId);
+  if (!milestone) throw new NotFoundError(`No milestone with id ${milestoneId}`);
+  if (milestone.project_id !== projectId) {
+    throw new ConflictError(`Milestone ${milestoneId} is in another project`);
+  }
+}
+
+export function createPlan(
+  database: Database.Database,
+  plan: {
+    projectId: number;
+    name: string;
+    description?: string | null;
+    milestoneId?: number | null;
+  },
+): number {
+  if (plan.milestoneId !== undefined && plan.milestoneId !== null) {
+    assertMilestoneInProject(database, plan.milestoneId, plan.projectId);
+  }
+  const result = database
+    .prepare(
+      `INSERT INTO plans (project_id, name, description, milestone_id, created_on)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(plan.projectId, plan.name, plan.description ?? null, plan.milestoneId ?? null, nowSeconds());
+  return Number(result.lastInsertRowid);
+}
+
+export function updatePlan(
+  database: Database.Database,
+  id: number,
+  patch: {
+    name?: string;
+    description?: string | null;
+    milestoneId?: number | null;
+    isCompleted?: boolean;
+  },
+): void {
+  const result = database
+    .prepare(
+      `UPDATE plans
+          SET name         = COALESCE(?, name),
+              description  = CASE WHEN ? THEN ? ELSE description END,
+              milestone_id = CASE WHEN ? THEN ? ELSE milestone_id END,
+              is_completed = COALESCE(?, is_completed)
+        WHERE id = ?`,
+    )
+    .run(
+      patch.name ?? null,
+      patch.description === undefined ? 0 : 1,
+      patch.description ?? null,
+      patch.milestoneId === undefined ? 0 : 1,
+      patch.milestoneId ?? null,
+      patch.isCompleted === undefined ? null : Number(patch.isCompleted),
+      id,
+    );
+  assertChanged(result.changes, "plan", id);
+}
+
+export function listRuns(
+  database: Database.Database,
+  filter: ListOptions & { projectId: number; planId?: number | null },
+): ListResult<RunRow> {
+  const conditions = ["project_id = ?"];
+  const values: unknown[] = [filter.projectId];
+  if (filter.planId !== undefined && filter.planId !== null) {
+    conditions.push("plan_id = ?");
+    values.push(filter.planId);
+  }
+  const where = `WHERE ${conditions.join(" AND ")}`;
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM runs ${where}`).get(...values) as {
+      total: number;
+    }
+  ).total;
+  /*
+    Open runs first: a closed run is history, an open one is somebody's
+    afternoon. This ORDER BY does sort rather than read an index, and that is
+    left alone on purpose - a project holds hundreds of runs, not hundreds of
+    thousands, and the sort measured 0.2ms. An index here would cost every
+    run insert to save nothing anyone can perceive.
+  */
+  const rows = database
+    .prepare(`SELECT * FROM runs ${where} ORDER BY is_completed, created_on DESC, id DESC
+              LIMIT ? OFFSET ?`)
+    .all(...values, clampPageSize(filter.limit), offsetFor(filter.page, filter.limit)) as RunRow[];
+  return paged(rows, total, filter);
+}
+
+export function getRun(database: Database.Database, id: number): RunRow | undefined {
+  return database.prepare("SELECT * FROM runs WHERE id = ?").get(id) as RunRow | undefined;
+}
+
+/*
+  A run is a snapshot, not a view. The case set is resolved once, here, and
+  every test keeps its own copy of the title - so editing or deleting a case
+  afterwards never rewrites what a past run said it covered.
+
+  The tests are inserted by INSERT ... SELECT rather than a loop in
+  TypeScript: include_all over a 100k-case suite is one statement either way,
+  and the loop version is the one that takes a minute.
+*/
+export function createRun(
+  database: Database.Database,
+  run: {
+    projectId: number;
+    suiteId: number;
+    name: string;
+    description?: string | null;
+    config?: string | null;
+    planId?: number | null;
+    milestoneId?: number | null;
+    includeAll?: boolean;
+    caseIds?: readonly number[];
+    assignedTo?: number | null;
+  },
+): number {
+  // Contradictory input is refused rather than resolved. Picking a winner
+  // between includeAll and an explicit case list means half of the callers
+  // who send both get the run they did not ask for, and never find out.
+  if (run.includeAll === true && run.caseIds !== undefined) {
+    throw new ConflictError("Send either includeAll or caseIds, not both");
+  }
+  const includeAll = run.includeAll !== false && run.caseIds === undefined;
+  if (!includeAll && (run.caseIds === undefined || run.caseIds.length === 0)) {
+    throw new ConflictError("A run needs either includeAll or a non-empty caseIds");
+  }
+  if (run.caseIds && run.caseIds.length > MAX_BULK_IDS) {
+    throw new ConflictError(`At most ${MAX_BULK_IDS} cases in one run creation`);
+  }
+
+  const suite = getSuite(database, run.suiteId);
+  if (!suite) throw new NotFoundError(`No suite with id ${run.suiteId}`);
+  if (suite.project_id !== run.projectId) {
+    throw new ConflictError(`Suite ${run.suiteId} is in another project`);
+  }
+  if (run.milestoneId !== undefined && run.milestoneId !== null) {
+    assertMilestoneInProject(database, run.milestoneId, run.projectId);
+  }
+
+  const create = database.transaction(() => {
+    const inserted = database
+      .prepare(
+        `INSERT INTO runs (project_id, suite_id, plan_id, milestone_id, name, description,
+                           config, include_all, created_on)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        run.projectId,
+        run.suiteId,
+        run.planId ?? null,
+        run.milestoneId ?? null,
+        run.name,
+        run.description ?? null,
+        run.config ?? null,
+        Number(includeAll),
+        nowSeconds(),
+      );
+    const runId = Number(inserted.lastInsertRowid);
+    const assignedTo = run.assignedTo ?? null;
+
+    if (includeAll) {
+      database
+        .prepare(
+          `INSERT INTO tests (run_id, case_id, title_snapshot, assigned_to)
+           SELECT ?, id, title, ? FROM cases WHERE suite_id = ? AND is_deleted = 0`,
+        )
+        .run(runId, assignedTo, run.suiteId);
+      return runId;
+    }
+
+    /*
+      The INSERT ... SELECT quietly skips an id that is deleted or in another
+      suite, so the count is compared afterwards and a short run is refused.
+      A run silently built from half of a stale selection is worse than an
+      error: nobody notices until the coverage numbers are wrong.
+    */
+    const wanted = new Set(run.caseIds ?? []);
+    let created = 0;
+    for (const chunk of chunked([...wanted])) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      created += database
+        .prepare(
+          `INSERT INTO tests (run_id, case_id, title_snapshot, assigned_to)
+           SELECT ?, id, title, ? FROM cases
+            WHERE id IN (${placeholders}) AND suite_id = ? AND is_deleted = 0`,
+        )
+        .run(runId, assignedTo, ...chunk, run.suiteId).changes;
+    }
+    if (created !== wanted.size) {
+      throw new ConflictError(
+        `${wanted.size - created} of ${wanted.size} cases are not live cases in suite ${run.suiteId}`,
+      );
+    }
+    return runId;
+  });
+  return create();
+}
+
+export function updateRun(
+  database: Database.Database,
+  id: number,
+  patch: { name?: string; description?: string | null; config?: string | null },
+): void {
+  const result = database
+    .prepare(
+      `UPDATE runs
+          SET name        = COALESCE(?, name),
+              description = CASE WHEN ? THEN ? ELSE description END,
+              config      = CASE WHEN ? THEN ? ELSE config END
+        WHERE id = ?`,
+    )
+    .run(
+      patch.name ?? null,
+      patch.description === undefined ? 0 : 1,
+      patch.description ?? null,
+      patch.config === undefined ? 0 : 1,
+      patch.config ?? null,
+      id,
+    );
+  assertChanged(result.changes, "run", id);
+}
+
+/*
+  is_completed is a lock, not a label: see recordResults. Reopening destroys
+  nothing, because closing never deleted anything - the results were all still
+  there.
+*/
+export function setRunCompleted(
+  database: Database.Database,
+  id: number,
+  isCompleted: boolean,
+): void {
+  const result = database
+    .prepare("UPDATE runs SET is_completed = ? WHERE id = ?")
+    .run(Number(isCompleted), id);
+  assertChanged(result.changes, "run", id);
+}
+
+/*
+  Close-or-reopen and rename arrive in one PATCH, so they commit together.
+  Separately, a rejected rename would leave a run closed that the caller
+  believes is still open.
+*/
+export function editRun(
+  database: Database.Database,
+  id: number,
+  patch: {
+    name?: string;
+    description?: string | null;
+    config?: string | null;
+    isCompleted?: boolean;
+  },
+): void {
+  const edit = database.transaction(() => {
+    if (patch.isCompleted !== undefined) setRunCompleted(database, id, patch.isCompleted);
+    if (patch.name !== undefined || patch.description !== undefined || patch.config !== undefined) {
+      updateRun(database, id, {
+        name: patch.name,
+        description: patch.description,
+        config: patch.config,
+      });
+    }
+  });
+  edit();
+}
+
+/*
+  Counting and deleting in one transaction, because the number is what the
+  caller reports back to a human. Two statements and the count is already
+  stale by the time anyone reads it.
+*/
+export function deleteRunWithCount(database: Database.Database, id: number): number {
+  const destroy = database.transaction(() => {
+    const destroyed = countRunResults(database, id);
+    deleteRun(database, id);
+    return destroyed;
+  });
+  return destroy();
+}
+
+// Cascades to tests and results. The only genuinely destructive path in the
+// product, which is why the caller is expected to have shown the count first.
+export function deleteRun(database: Database.Database, id: number): void {
+  const result = database.prepare("DELETE FROM runs WHERE id = ?").run(id);
+  assertChanged(result.changes, "run", id);
+}
+
+export function countRunResults(database: Database.Database, runId: number): number {
+  const row = database
+    .prepare(
+      `SELECT COUNT(*) AS total FROM results
+        WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)`,
+    )
+    .get(runId) as { total: number };
+  return row.total;
+}
+
+export type TestFilter = ListOptions & {
+  statusIds?: readonly number[];
+  assignedTo?: number | null;
+};
+
+export function listTests(
+  database: Database.Database,
+  runId: number,
+  filter: TestFilter = {},
+): ListResult<TestRow> {
+  const conditions = ["run_id = ?"];
+  const values: unknown[] = [runId];
+
+  if (filter.statusIds && filter.statusIds.length > 0) {
+    conditions.push(`status_id IN (${filter.statusIds.map(() => "?").join(", ")})`);
+    values.push(...filter.statusIds);
+  }
+  if (filter.assignedTo !== undefined && filter.assignedTo !== null) {
+    conditions.push("assigned_to = ?");
+    values.push(filter.assignedTo);
+  }
+  if (filter.search?.trim()) {
+    conditions.push("title_snapshot LIKE ? ESCAPE '\\'");
+    values.push(likePattern(filter.search));
+  }
+
+  const where = `WHERE ${conditions.join(" AND ")}`;
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM tests ${where}`).get(...values) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(`SELECT * FROM tests ${where} ORDER BY id LIMIT ? OFFSET ?`)
+    .all(...values, clampPageSize(filter.limit), offsetFor(filter.page, filter.limit)) as TestRow[];
+  return paged(rows, total, filter);
+}
+
+export function getTest(database: Database.Database, id: number): TestRow | undefined {
+  return database.prepare("SELECT * FROM tests WHERE id = ?").get(id) as TestRow | undefined;
+}
+
+/*
+  Assignment is a work queue, not a lock: anyone may record a result on any
+  test in an open run, and there is deliberately no ownership check anywhere
+  below. In a real team the person free at five o'clock finishes someone
+  else's run, and a tool that blocks that gets worked around within a week.
+*/
+export function assignTests(
+  database: Database.Database,
+  testIds: readonly number[],
+  userId: number | null,
+  runId?: number,
+): number {
+  if (testIds.length > MAX_BULK_IDS) {
+    throw new ConflictError(`At most ${MAX_BULK_IDS} ids in one call, got ${testIds.length}`);
+  }
+  const assign = database.transaction(() => {
+    if (runId !== undefined) assertTestsInRun(database, runId, testIds);
+    let changed = 0;
+    for (const chunk of chunked(testIds)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      changed += database
+        .prepare(`UPDATE tests SET assigned_to = ? WHERE id IN (${placeholders})`)
+        .run(userId, ...chunk).changes;
+    }
+    return changed;
+  });
+  return assign();
+}
+
+/*
+  A route that names a run in its path has to mean it. Without this the id in
+  /api/runs/2/tests/status was decorative: a body carrying a test from run 1
+  recorded against run 1 and answered as though run 2 had changed, and a run
+  id that did not exist at all answered the same way.
+*/
+export function assertTestsInRun(
+  database: Database.Database,
+  runId: number,
+  testIds: readonly number[],
+): void {
+  if (!getRun(database, runId)) throw new NotFoundError(`No run with id ${runId}`);
+  for (const chunk of chunked(testIds)) {
+    const placeholders = chunk.map(() => "?").join(", ");
+    const found = database
+      .prepare(
+        `SELECT COUNT(*) AS total FROM tests WHERE run_id = ? AND id IN (${placeholders})`,
+      )
+      .get(runId, ...chunk) as { total: number };
+    if (found.total !== new Set(chunk).size) {
+      throw new ConflictError(`Some of those tests are not in run ${runId}`);
+    }
+  }
+}
+
+export type ResultInput = {
+  testId: number;
+  statusId: number;
+  comment?: string | null;
+  elapsed?: string | null;
+  defects?: string | null;
+  version?: string | null;
+  assignedTo?: number | null;
+  custom?: Record<string, unknown>;
+  createdBy?: number | null;
+};
+
+// Failing or blocking without saying why leaves somebody reproducing it from
+// scratch tomorrow. Enforced here rather than in the route so the CI reporter
+// path cannot skip it.
+const COMMENT_REQUIRED_FOR: readonly number[] = [RESULT_STATUS.failed, RESULT_STATUS.blocked];
+
+/*
+  The one write path for a result. addResult, setStatusBulk and
+  addResultsBulk all build entries and come through here, so there is a
+  single place where a status is checked, a closed run is refused and
+  tests.status_id is kept in step.
+
+  Results are append-only: there is no update and no delete, and a correction
+  is a new row. The denormalised tests.status_id is written by the same
+  transaction that inserts the result, never by a second call, or the cache
+  desyncs the first time a request dies midway.
+*/
+function recordResults(database: Database.Database, entries: readonly ResultInput[]): number[] {
+  if (entries.length === 0) return [];
+  if (entries.length > MAX_BULK_IDS) {
+    throw new ConflictError(`At most ${MAX_BULK_IDS} results in one call, got ${entries.length}`);
+  }
+
+  const write = database.transaction(() => {
+    const statuses = new Map(listStatuses(database).map((status) => [status.id, status]));
+    for (const entry of entries) {
+      const status = statuses.get(entry.statusId);
+      if (!status) throw new NotFoundError(`No status with id ${entry.statusId}`);
+      if (!isAssignableStatus(status)) {
+        throw new ConflictError(
+          `"${status.label}" is the absence of a result, not one that can be recorded`,
+        );
+      }
+      if (COMMENT_REQUIRED_FOR.includes(entry.statusId) && !entry.comment?.trim()) {
+        throw new ConflictError(`A "${status.label}" result needs a comment`);
+      }
+    }
+
+    const runOf = database.prepare(
+      `SELECT runs.id AS run_id, runs.name, runs.is_completed
+         FROM tests JOIN runs ON runs.id = tests.run_id
+        WHERE tests.id = ?`,
+    );
+    for (const testId of new Set(entries.map((entry) => entry.testId))) {
+      const run = runOf.get(testId) as
+        | { run_id: number; name: string; is_completed: number }
+        | undefined;
+      if (!run) throw new NotFoundError(`No test with id ${testId}`);
+      if (run.is_completed === 1) {
+        throw new ConflictError(`Run ${run.run_id} ("${run.name}") is closed`);
+      }
+    }
+
+    const insert = database.prepare(
+      `INSERT INTO results (test_id, status_id, comment, version, elapsed, defects,
+                            assigned_to, custom, created_by, created_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const cacheStatus = database.prepare("UPDATE tests SET status_id = ? WHERE id = ?");
+    const reassign = database.prepare("UPDATE tests SET assigned_to = ? WHERE id = ?");
+    const timestamp = nowSeconds();
+    const ids: number[] = [];
+
+    for (const entry of entries) {
+      ids.push(
+        Number(
+          insert.run(
+            entry.testId,
+            entry.statusId,
+            entry.comment ?? null,
+            entry.version ?? null,
+            entry.elapsed ?? null,
+            entry.defects ?? null,
+            entry.assignedTo ?? null,
+            entry.custom ? JSON.stringify(entry.custom) : null,
+            entry.createdBy ?? null,
+            timestamp,
+          ).lastInsertRowid,
+        ),
+      );
+      cacheStatus.run(entry.statusId, entry.testId);
+      // TestRail's reassign-on-result: how a failed test reaches the person
+      // who will retest it. Absent means leave the assignee alone.
+      if (entry.assignedTo !== undefined) reassign.run(entry.assignedTo, entry.testId);
+    }
+    return ids;
+  });
+  return write();
+}
+
+export function addResult(database: Database.Database, entry: ResultInput): number {
+  return recordResults(database, [entry])[0];
+}
+
+// "Select forty rows and mark them all blocked". The same write as addResult,
+// batched - not a second code path with its own idea of the rules.
+export function setStatusBulk(
+  database: Database.Database,
+  testIds: readonly number[],
+  statusId: number,
+  options: { comment?: string | null; createdBy?: number | null; runId?: number } = {},
+): number {
+  const entries = testIds.map((testId) => ({
+    testId,
+    statusId,
+    comment: options.comment ?? null,
+    createdBy: options.createdBy ?? null,
+  }));
+  const write = database.transaction(() => {
+    if (options.runId !== undefined) assertTestsInRun(database, options.runId, testIds);
+    return recordResults(database, entries).length;
+  });
+  return write();
+}
+
+// The path a CI run actually uses: many tests, many statuses, one
+// transaction. It must not be N round trips.
+export function addResultsBulk(
+  database: Database.Database,
+  entries: readonly ResultInput[],
+): number {
+  return recordResults(database, entries).length;
+}
+
+export function listResults(
+  database: Database.Database,
+  testId: number,
+  options: ListOptions = {},
+): ListResult<ResultRow> {
+  const total = (
+    database.prepare("SELECT COUNT(*) AS total FROM results WHERE test_id = ?").get(testId) as {
+      total: number;
+    }
+  ).total;
+  // Newest first, straight off idx_results_test. This list is the change log;
+  // there is no separate audit table.
+  const rows = database
+    .prepare(
+      "SELECT * FROM results WHERE test_id = ? ORDER BY created_on DESC, id DESC LIMIT ? OFFSET ?",
+    )
+    .all(testId, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as ResultRow[];
+  return paged(rows, total, options);
+}
+
+/* Rollups are SQL aggregates. Never fetch tests and count them in JS. */
+
+export function runSummary(database: Database.Database, runId: number): StatusCount[] {
+  return database
+    .prepare(
+      "SELECT status_id, COUNT(*) AS total FROM tests WHERE run_id = ? GROUP BY status_id",
+    )
+    .all(runId) as StatusCount[];
+}
+
+export function planSummary(database: Database.Database, planId: number): StatusCount[] {
+  return database
+    .prepare(
+      `SELECT tests.status_id, COUNT(*) AS total
+         FROM tests JOIN runs ON runs.id = tests.run_id
+        WHERE runs.plan_id = ?
+        GROUP BY tests.status_id`,
+    )
+    .all(planId) as StatusCount[];
+}
+
+/*
+  Milestones nest, so this rolls up the whole branch: the milestone's own runs
+  plus every descendant milestone's. One recursive CTE, same level bound as
+  the section tree for the same reason.
+*/
+export function milestoneSummary(
+  database: Database.Database,
+  milestoneId: number,
+): StatusCount[] {
+  return database
+    .prepare(
+      `WITH RECURSIVE branch AS (
+         SELECT id, 0 AS level FROM milestones WHERE id = ?
+          UNION ALL
+         SELECT child.id, branch.level + 1
+           FROM milestones child
+           JOIN branch ON child.parent_id = branch.id
+          WHERE branch.level + 1 < ?
+       )
+       SELECT tests.status_id, COUNT(*) AS total
+         FROM tests
+         JOIN runs ON runs.id = tests.run_id
+        WHERE runs.milestone_id IN (SELECT id FROM branch)
+        GROUP BY tests.status_id`,
+    )
+    .all(milestoneId, MAX_MILESTONE_LEVELS) as StatusCount[];
+}
+
+export function insertAttachment(
+  database: Database.Database,
+  attachment: {
+    entityType: AttachmentEntity;
+    entityId: number;
+    filename: string;
+    mime: string | null;
+    size: number;
+    storagePath: string;
+  },
+): number {
+  const result = database
+    .prepare(
+      `INSERT INTO attachments (entity_type, entity_id, filename, mime, size, storage_path, created_on)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      attachment.entityType,
+      attachment.entityId,
+      attachment.filename,
+      attachment.mime,
+      attachment.size,
+      attachment.storagePath,
+      nowSeconds(),
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function getAttachment(database: Database.Database, id: number): AttachmentRow | undefined {
+  return database.prepare("SELECT * FROM attachments WHERE id = ?").get(id) as
+    | AttachmentRow
+    | undefined;
+}
+
+export function listAttachments(
+  database: Database.Database,
+  entityType: AttachmentEntity,
+  entityId: number,
+): AttachmentRow[] {
+  return database
+    .prepare(
+      "SELECT * FROM attachments WHERE entity_type = ? AND entity_id = ? ORDER BY created_on, id",
+    )
+    .all(entityType, entityId) as AttachmentRow[];
 }
