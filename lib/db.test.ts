@@ -34,8 +34,37 @@ import {
   sectionTree,
   updateCase,
   upsertCaseField,
+  addResult,
+  addResultsBulk,
+  assignTests,
+  countRunResults,
+  createMilestone,
+  createPlan,
+  createRun,
+  deleteRun,
+  editRun,
+  getRun,
+  getTest,
+  listResults,
+  listStatuses,
+  listTests,
+  milestoneSummary,
+  planSummary,
+  runSummary,
+  setRunCompleted,
+  setStatusBulk,
 } from "./db";
-import { CASE_PRIORITY, CASE_TYPE, MAX_SECTION_LEVELS, RESULT_STATUS } from "./format";
+import { storageNameFor } from "./attachments";
+import {
+  CASE_PRIORITY,
+  CASE_TYPE,
+  FIRST_CUSTOM_STATUS_ID,
+  MAX_SECTION_LEVELS,
+  RESULT_STATUS,
+  formatElapsed,
+  parseElapsed,
+  runProgress,
+} from "./format";
 
 let directory: string;
 let database: Database.Database;
@@ -745,5 +774,405 @@ describe("case repository", () => {
       expect(row?.priority_id).toBe(CASE_PRIORITY.critical);
       expect(row?.type_id).toBe(CASE_TYPE.functional);
     }
+  });
+});
+
+describe("execution", () => {
+  function seedRun(caseCount = 3) {
+    const projectId = createProject(database, { name: "Payments" });
+    const suiteId = createSuite(database, { projectId, name: "API" });
+    const section = createSection(database, { suiteId, name: "health" });
+    for (let index = 0; index < caseCount; index += 1) {
+      createCase(database, { suiteId, sectionId: section, title: `Case ${index}` });
+    }
+    const runId = createRun(database, { projectId, suiteId, name: "Regression", includeAll: true });
+    return { projectId, suiteId, runId };
+  }
+
+  // Pages rather than asking for one big limit: clampPageSize snaps anything
+  // outside PAGE_SIZES back to the default, so "give me all of them" is not
+  // a thing a caller gets to ask for, in a test either.
+  function testIdsOf(runId: number): number[] {
+    const ids: number[] = [];
+    for (let page = 1; ; page += 1) {
+      const slice = listTests(database, runId, { page, limit: 100 });
+      ids.push(...slice.rows.map((test) => test.id));
+      if (ids.length >= slice.total) return ids;
+    }
+  }
+
+  it("snapshots the case set, and the titles with it", () => {
+    const { suiteId, runId } = seedRun(2);
+    const caseId = listCases(database, suiteId, {}).rows[0].id;
+
+    updateCase(database, caseId, { title: "renamed after the run" }, null);
+    deleteCase(database, listCases(database, suiteId, {}).rows[0].id, null);
+
+    const tests = listTests(database, runId, {});
+    expect(tests.total).toBe(2);
+    expect(tests.rows.map((test) => test.title_snapshot).sort()).toEqual(["Case 0", "Case 1"]);
+  });
+
+  it("starts every test untested, with no result rows", () => {
+    const { runId } = seedRun(3);
+    expect(runSummary(database, runId)).toEqual([
+      { status_id: RESULT_STATUS.untested, total: 3 },
+    ]);
+    const results = database.prepare("SELECT COUNT(*) AS total FROM results").get() as {
+      total: number;
+    };
+    expect(results.total).toBe(0);
+  });
+
+  it("refuses to record untested as a result", () => {
+    const { runId } = seedRun(1);
+    expect(() =>
+      addResult(database, { testId: testIdsOf(runId)[0], statusId: RESULT_STATUS.untested }),
+    ).toThrow(/absence of a result/i);
+  });
+
+  it("requires a comment for failed and blocked, but not for passed", () => {
+    const { runId } = seedRun(2);
+    const [first, second] = testIdsOf(runId);
+    expect(() => addResult(database, { testId: first, statusId: RESULT_STATUS.failed })).toThrow(
+      /needs a comment/i,
+    );
+    expect(() =>
+      addResult(database, { testId: first, statusId: RESULT_STATUS.blocked, comment: "   " }),
+    ).toThrow(/needs a comment/i);
+    expect(() => addResult(database, { testId: second, statusId: RESULT_STATUS.passed })).not.toThrow();
+  });
+
+  it("keeps every result and reads the latest as the test status", () => {
+    const { runId } = seedRun(1);
+    const [testId] = testIdsOf(runId);
+    addResult(database, { testId, statusId: RESULT_STATUS.failed, comment: "timeout" });
+    addResult(database, { testId, statusId: RESULT_STATUS.retest });
+    addResult(database, { testId, statusId: RESULT_STATUS.passed });
+
+    expect(getTest(database, testId)?.status_id).toBe(RESULT_STATUS.passed);
+    const history = listResults(database, testId, {});
+    expect(history.total).toBe(3);
+    expect(history.rows.map((row) => row.status_id)).toEqual([
+      RESULT_STATUS.passed,
+      RESULT_STATUS.retest,
+      RESULT_STATUS.failed,
+    ]);
+  });
+
+  it("writes the result and the cached status in one transaction", () => {
+    const { runId } = seedRun(1);
+    const [testId] = testIdsOf(runId);
+    // A status that passes the assignable check and then fails the foreign
+    // key, so the failure lands between the insert and the cache update.
+    database.prepare("INSERT INTO statuses (id, system_name, label) VALUES (99, 'ghost', 'Ghost')").run();
+    database.prepare("DELETE FROM statuses WHERE id = 99").run();
+
+    expect(() => addResult(database, { testId, statusId: 99 })).toThrow();
+    const results = database.prepare("SELECT COUNT(*) AS total FROM results").get() as {
+      total: number;
+    };
+    expect(results.total).toBe(0);
+    expect(getTest(database, testId)?.status_id).toBe(RESULT_STATUS.untested);
+  });
+
+  it("locks a closed run against every write path, and unlocks on reopen", () => {
+    const { runId } = seedRun(2);
+    const ids = testIdsOf(runId);
+    setRunCompleted(database, runId, true);
+
+    expect(() => addResult(database, { testId: ids[0], statusId: RESULT_STATUS.passed })).toThrow(
+      new RegExp(`Run ${runId}`),
+    );
+    expect(() => setStatusBulk(database, ids, RESULT_STATUS.passed)).toThrow(/is closed/i);
+    expect(() =>
+      addResultsBulk(database, [{ testId: ids[0], statusId: RESULT_STATUS.passed }]),
+    ).toThrow(/is closed/i);
+
+    setRunCompleted(database, runId, false);
+    expect(() => addResult(database, { testId: ids[0], statusId: RESULT_STATUS.passed })).not.toThrow();
+  });
+
+  it("records a bulk status as one result per test", () => {
+    const { runId } = seedRun(600);
+    const ids = testIdsOf(runId);
+    expect(ids).toHaveLength(600);
+
+    expect(setStatusBulk(database, ids, RESULT_STATUS.blocked, { comment: "env down" })).toBe(600);
+    expect(runSummary(database, runId)).toEqual([{ status_id: RESULT_STATUS.blocked, total: 600 }]);
+    const results = database.prepare("SELECT COUNT(*) AS total FROM results").get() as {
+      total: number;
+    };
+    expect(results.total).toBe(600);
+  });
+
+  it("treats an imported custom status as first class", () => {
+    const { runId } = seedRun(1);
+    const [testId] = testIdsOf(runId);
+    database
+      .prepare(
+        "INSERT INTO statuses (id, system_name, label, is_untested, is_final) VALUES (?, ?, ?, 0, 1)",
+      )
+      .run(FIRST_CUSTOM_STATUS_ID, "wont_fix", "Won't fix");
+
+    addResult(database, { testId, statusId: FIRST_CUSTOM_STATUS_ID });
+    expect(runSummary(database, runId)).toEqual([
+      { status_id: FIRST_CUSTOM_STATUS_ID, total: 1 },
+    ]);
+    const progress = runProgress(runSummary(database, runId), listStatuses(database));
+    expect(progress.executed).toBe(1);
+    expect(progress.passRate).toBe(0);
+  });
+
+  it("reports a pass rate over executed tests, never over the whole run", () => {
+    const { runId } = seedRun(100);
+    const ids = testIdsOf(runId);
+    setStatusBulk(database, ids.slice(0, 10), RESULT_STATUS.passed);
+    setStatusBulk(database, ids.slice(10, 12), RESULT_STATUS.failed, { comment: "broken" });
+
+    const progress = runProgress(runSummary(database, runId), listStatuses(database));
+    expect(progress.total).toBe(100);
+    expect(progress.untested).toBe(88);
+    expect(progress.executed).toBe(12);
+    expect(Math.round((progress.passRate ?? 0) * 100)).toBe(83);
+  });
+
+  it("has no pass rate at all before anything is executed", () => {
+    const { runId } = seedRun(5);
+    expect(runProgress(runSummary(database, runId), listStatuses(database)).passRate).toBeNull();
+  });
+
+  it("rolls a plan and a nested milestone up in one query each", () => {
+    const projectId = createProject(database, { name: "P" });
+    const suiteId = createSuite(database, { projectId, name: "S" });
+    createCase(database, { suiteId, title: "only case" });
+    const parent = createMilestone(database, { projectId, name: "Q1" });
+    const child = createMilestone(database, { projectId, parentId: parent, name: "Sprint 1" });
+    const planId = createPlan(database, { projectId, name: "Release" });
+
+    const inPlan = createRun(database, { projectId, suiteId, name: "A", planId, milestoneId: child });
+    const loose = createRun(database, { projectId, suiteId, name: "B", milestoneId: parent });
+    addResult(database, {
+      testId: testIdsOf(inPlan)[0],
+      statusId: RESULT_STATUS.passed,
+    });
+    addResult(database, {
+      testId: testIdsOf(loose)[0],
+      statusId: RESULT_STATUS.failed,
+      comment: "nope",
+    });
+
+    expect(planSummary(database, planId)).toEqual([{ status_id: RESULT_STATUS.passed, total: 1 }]);
+    expect(milestoneSummary(database, child)).toEqual([
+      { status_id: RESULT_STATUS.passed, total: 1 },
+    ]);
+    expect(milestoneSummary(database, parent).map((row) => row.total).reduce((a, b) => a + b)).toBe(2);
+  });
+
+  it("assigns without locking: anyone may record on an assigned test", () => {
+    const { runId } = seedRun(2);
+    const ids = testIdsOf(runId);
+    const owner = createUser(database, { email: "owner@example.com", role: "tester", passwordHash: null });
+    const other = createUser(database, { email: "other@example.com", role: "tester", passwordHash: null });
+
+    expect(assignTests(database, ids, owner)).toBe(2);
+    expect(() =>
+      addResult(database, { testId: ids[0], statusId: RESULT_STATUS.passed, createdBy: other }),
+    ).not.toThrow();
+
+    // Reassign on result: how a failure reaches whoever will retest it.
+    addResult(database, {
+      testId: ids[1],
+      statusId: RESULT_STATUS.failed,
+      comment: "over to you",
+      assignedTo: other,
+      createdBy: owner,
+    });
+    expect(getTest(database, ids[1])?.assigned_to).toBe(other);
+  });
+
+  it("takes the run's tests and results with it when the run is deleted", () => {
+    const { runId } = seedRun(2);
+    setStatusBulk(database, testIdsOf(runId), RESULT_STATUS.passed);
+    expect(countRunResults(database, runId)).toBe(2);
+
+    deleteRun(database, runId);
+
+    for (const table of ["tests", "results"]) {
+      const row = database.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as {
+        total: number;
+      };
+      expect(row.total, table).toBe(0);
+    }
+  });
+
+  it("reads a page of a run's tests without sorting the whole run", () => {
+    const { runId } = seedRun(30);
+    const plan = database
+      .prepare("EXPLAIN QUERY PLAN SELECT * FROM tests WHERE run_id = ? ORDER BY id LIMIT ? OFFSET ?")
+      .all(runId, 25, 0) as { detail: string }[];
+    // 90ms a page at 100k tests when this index was missing.
+    expect(plan.map((step) => step.detail).join(" ")).not.toMatch(/TEMP B-TREE/);
+  });
+
+  it("refuses a run whose suite belongs to another project", () => {
+    const other = createProject(database, { name: "Elsewhere" });
+    const otherSuite = createSuite(database, { projectId: other, name: "Theirs" });
+    const projectId = createProject(database, { name: "Ours" });
+    expect(() =>
+      createRun(database, { projectId, suiteId: otherSuite, name: "cross", includeAll: true }),
+    ).toThrow(/another project/i);
+  });
+
+  it("refuses a plan or a run pointing at another project's milestone", () => {
+    const other = createProject(database, { name: "Elsewhere" });
+    const theirMilestone = createMilestone(database, { projectId: other, name: "Theirs" });
+    const projectId = createProject(database, { name: "Ours" });
+    const suiteId = createSuite(database, { projectId, name: "S" });
+
+    expect(() =>
+      createPlan(database, { projectId, name: "p", milestoneId: theirMilestone }),
+    ).toThrow(/another project/i);
+    expect(() =>
+      createRun(database, {
+        projectId,
+        suiteId,
+        name: "r",
+        includeAll: true,
+        milestoneId: theirMilestone,
+      }),
+    ).toThrow(/another project/i);
+  });
+
+  it("refuses a run built from case ids it cannot use, instead of a short run", () => {
+    const projectId = createProject(database, { name: "P" });
+    const suiteId = createSuite(database, { projectId, name: "S" });
+    const other = createSuite(database, { projectId, name: "Other" });
+    const mine = createCase(database, { suiteId, title: "mine" });
+    const theirs = createCase(database, { suiteId: other, title: "theirs" });
+    const deleted = createCase(database, { suiteId, title: "deleted" });
+    deleteCase(database, deleted, null);
+
+    expect(() =>
+      createRun(database, { projectId, suiteId, name: "r", caseIds: [mine, theirs] }),
+    ).toThrow(/1 of 2 cases/);
+    expect(() =>
+      createRun(database, { projectId, suiteId, name: "r", caseIds: [mine, deleted] }),
+    ).toThrow(/1 of 2 cases/);
+    expect(() =>
+      createRun(database, { projectId, suiteId, name: "r", caseIds: [mine] }),
+    ).not.toThrow();
+  });
+
+  it("refuses includeAll and caseIds together rather than picking one", () => {
+    const projectId = createProject(database, { name: "P" });
+    const suiteId = createSuite(database, { projectId, name: "S" });
+    const caseId = createCase(database, { suiteId, title: "c" });
+    expect(() =>
+      createRun(database, { projectId, suiteId, name: "r", includeAll: true, caseIds: [caseId] }),
+    ).toThrow(/not both/i);
+  });
+
+  it("will not write through a run id that does not own the tests", () => {
+    const { runId: first } = seedRun(1);
+    const { runId: second } = seedRun(1);
+    const [strayTest] = testIdsOf(first);
+
+    expect(() =>
+      setStatusBulk(database, [strayTest], RESULT_STATUS.passed, { runId: second }),
+    ).toThrow(/not in run/i);
+    expect(() => assignTests(database, [strayTest], null, second)).toThrow(/not in run/i);
+    expect(() => assignTests(database, [strayTest], null, 9999)).toThrow(/No run with id 9999/);
+
+    // Untouched by any of the three.
+    expect(getTest(database, strayTest)?.status_id).toBe(RESULT_STATUS.untested);
+  });
+
+  it("rolls a close back when the rename in the same edit is rejected", () => {
+    const { runId } = seedRun(1);
+    expect(() => editRun(database, runId, { isCompleted: true, name: "x" })).not.toThrow();
+    setRunCompleted(database, runId, false);
+
+    // updateRun rejects an unknown id; here the close lands first and has to
+    // come back with it.
+    expect(() => editRun(database, 9999, { isCompleted: true, name: "x" })).toThrow();
+    expect(getRun(database, runId)?.is_completed).toBe(0);
+  });
+
+  it("orders one transaction's worth of results deterministically", () => {
+    const { runId } = seedRun(1);
+    const [testId] = testIdsOf(runId);
+    // Three results in one call share a timestamp, so created_on alone
+    // cannot order them.
+    addResultsBulk(database, [
+      { testId, statusId: RESULT_STATUS.failed, comment: "one" },
+      { testId, statusId: RESULT_STATUS.retest },
+      { testId, statusId: RESULT_STATUS.passed },
+    ]);
+    const history = listResults(database, testId, {});
+    expect(history.rows.map((row) => row.comment)).toEqual([null, null, "one"]);
+    expect(history.rows.map((row) => row.status_id)).toEqual([
+      RESULT_STATUS.passed,
+      RESULT_STATUS.retest,
+      RESULT_STATUS.failed,
+    ]);
+  });
+
+  it("reads a milestone rollup without scanning every test in the database", () => {
+    const projectId = createProject(database, { name: "P" });
+    const plan = database
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT tests.status_id, COUNT(*) FROM tests JOIN runs ON runs.id = tests.run_id
+          WHERE runs.milestone_id IN (SELECT id FROM milestones WHERE project_id = ?)
+          GROUP BY tests.status_id`,
+      )
+      .all(projectId) as { detail: string }[];
+    // Without idx_runs_milestone the planner inverts the join and scans the
+    // whole tests table: 2.05ms for a milestone holding three tests.
+    expect(plan.map((step) => step.detail).join(" ")).not.toMatch(/SCAN tests/);
+  });
+
+  it("reads a result history without sorting its tiebreak", () => {
+    const plan = database
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT * FROM results WHERE test_id = ? ORDER BY created_on DESC, id DESC LIMIT ? OFFSET ?",
+      )
+      .all(1, 25, 0) as { detail: string }[];
+    expect(plan.map((step) => step.detail).join(" ")).not.toMatch(/TEMP B-TREE/);
+  });
+
+  it("caps a bulk result call", () => {
+    const { runId } = seedRun(1);
+    const [testId] = testIdsOf(runId);
+    const tooMany = Array.from({ length: MAX_BULK_IDS + 1 }, () => testId);
+    expect(() => setStatusBulk(database, tooMany, RESULT_STATUS.passed)).toThrow(/At most/);
+  });
+});
+
+describe("attachment storage", () => {
+  it("never derives the stored name from what the uploader sent", () => {
+    expect(storageNameFor("../../etc/passwd")).toMatch(/^[0-9a-f]{32}$/);
+    expect(storageNameFor("report.png")).toMatch(/^[0-9a-f]{32}\.png$/);
+    expect(storageNameFor("sneaky.pn/../g")).toMatch(/^[0-9a-f]{32}$/);
+    expect(storageNameFor("no-extension")).toMatch(/^[0-9a-f]{32}$/);
+  });
+});
+
+describe("elapsed time", () => {
+  it("reads TestRail's format and leaves unreadable input null", () => {
+    expect(parseElapsed("1m 45s")).toBe(105);
+    expect(parseElapsed("2h 3m 4s")).toBe(7384);
+    expect(parseElapsed("30s")).toBe(30);
+    // Null, not zero: a value we failed to read must not count as no time.
+    expect(parseElapsed("a while")).toBeNull();
+    expect(parseElapsed("")).toBeNull();
+    expect(parseElapsed(null)).toBeNull();
+  });
+
+  it("round trips through the formatter", () => {
+    expect(formatElapsed(parseElapsed("1m 45s"))).toBe("1m 45s");
+    expect(formatElapsed(parseElapsed("2h 3m 4s"))).toBe("2h 3m 4s");
+    expect(formatElapsed(0)).toBeNull();
   });
 });
