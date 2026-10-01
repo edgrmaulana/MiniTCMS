@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { randomBytes, scryptSync } from "node:crypto";
 import {
   createSessionToken,
   hashPassword,
@@ -33,6 +34,56 @@ describe("password hashing", () => {
     expect(await verifyPassword("whatever", "")).toBe(false);
     expect(await verifyPassword("whatever", "bcrypt$1$2$3$4$5")).toBe(false);
     expect(await verifyPassword("whatever", "scrypt$x$8$1$c2FsdA==$aGFzaA==")).toBe(false);
+  });
+
+  /*
+    A truncated or corrupted tail used to decode to zero bytes, derive a
+    zero-length key, and compare equal - so every password verified against
+    it. Any row the import left half-written was an account takeover.
+  */
+  it("never accepts a password against a hash with no derived key", async () => {
+    const real = await hashPassword("the real password");
+    const truncated = real.slice(0, real.lastIndexOf("$") + 1);
+    expect(await verifyPassword("totally wrong", truncated)).toBe(false);
+    expect(await verifyPassword("totally wrong", "scrypt$16384$8$1$c2FsdA==$")).toBe(false);
+    expect(await verifyPassword("totally wrong", "scrypt$16384$8$1$c2FsdA==$!!!")).toBe(false);
+  });
+
+  it("rejects a hash whose key or salt is the wrong length", async () => {
+    const shortKey = Buffer.alloc(32).toString("base64");
+    const fullKey = Buffer.alloc(64).toString("base64");
+    const fullSalt = Buffer.alloc(16).toString("base64");
+    expect(await verifyPassword("whatever", `scrypt$16384$8$1$${fullSalt}$${shortKey}`)).toBe(false);
+    expect(await verifyPassword("whatever", `scrypt$16384$8$1$c2FsdA==$${fullKey}`)).toBe(false);
+  });
+
+  it("returns false for out-of-range parameters rather than throwing", async () => {
+    const key = Buffer.alloc(64).toString("base64");
+    const salt = Buffer.alloc(16).toString("base64");
+    for (const cost of ["3", "-1", "1e9", "24576", "0"]) {
+      await expect(
+        verifyPassword("whatever", `scrypt$${cost}$8$1$${salt}$${key}`),
+      ).resolves.toBe(false);
+    }
+    for (const bad of [`scrypt$16384$0$1$${salt}$${key}`, `scrypt$16384$8$0$${salt}$${key}`]) {
+      await expect(verifyPassword("whatever", bad)).resolves.toBe(false);
+    }
+  });
+
+  // The stored parameters exist so the cost can be raised without
+  // invalidating old hashes; this proves a hash at a higher N still verifies.
+  it("verifies a hash written at a raised cost", async () => {
+    const cost = 32768;
+    const salt = randomBytes(16);
+    const derived = scryptSync("the real password", salt, 64, {
+      N: cost,
+      r: 8,
+      p: 1,
+      maxmem: 256 * cost * 8,
+    });
+    const stored = `scrypt$${cost}$8$1$${salt.toString("base64")}$${derived.toString("base64")}`;
+    expect(await verifyPassword("the real password", stored)).toBe(true);
+    expect(await verifyPassword("not it", stored)).toBe(false);
   });
 });
 

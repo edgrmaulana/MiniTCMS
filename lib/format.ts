@@ -72,12 +72,29 @@ export const CASE_TEMPLATE = {
   exploratory: 3,
 } as const;
 
-// TestRail caps section nesting here, and a deeper tree is unreadable anyway.
-export const MAX_SECTION_DEPTH = 6;
+/*
+  Levels, not a maximum depth value: `depth` is 0-indexed, so 6 levels means
+  depths 0 through 5. Named this way because `depth <= MAX_SECTION_DEPTH` is
+  the guard everyone writes by reflex, and with a depth-named constant that
+  guard is off by one against the CHECK.
+*/
+export const MAX_SECTION_LEVELS = 6;
+
+// What an attachment can hang off. Interpolated into the CHECK in lib/db.ts.
+export const ATTACHMENT_ENTITIES = ["case", "test", "result"] as const;
+
+export type AttachmentEntity = (typeof ATTACHMENT_ENTITIES)[number];
 
 export const PAGE_SIZES = [25, 50, 100] as const;
 
 export const DEFAULT_PAGE_SIZE = PAGE_SIZES[0];
+
+/*
+  A ceiling, so an absurd ?page= is an empty result rather than a 500: an
+  unbounded page multiplies into an offset SQLite cannot bind, and Infinity
+  raises "datatype mismatch" instead of returning no rows.
+*/
+export const MAX_PAGE = 1_000_000;
 
 export function clampPageSize(value: unknown): number {
   const requested = Number(value);
@@ -90,11 +107,13 @@ export function clampPageSize(value: unknown): number {
 
 export function clampPage(value: unknown): number {
   const requested = Math.floor(Number(value));
-  return Number.isFinite(requested) && requested > 0 ? requested : 1;
+  if (!Number.isFinite(requested) || requested < 1) return 1;
+  return Math.min(requested, MAX_PAGE);
 }
 
-export function offsetFor(page: unknown, limit: number): number {
-  return (clampPage(page) - 1) * limit;
+// Clamps both sides itself rather than trusting the caller to have done it.
+export function offsetFor(page: unknown, limit: unknown): number {
+  return (clampPage(page) - 1) * clampPageSize(limit);
 }
 
 export type UserRow = {

@@ -6,7 +6,9 @@ import { openDb, createUser, findUserByEmail } from "../lib/db.ts";
 import { hashPassword, isValidEmail, passwordComplaint } from "../lib/auth.ts";
 import { USER_ROLES, isUserRole } from "../lib/format.ts";
 
-const [email, role = "admin"] = process.argv.slice(2);
+// Least privilege by default: an omitted or shifted argument must not
+// silently mint an admin.
+const [email, role = "tester"] = process.argv.slice(2);
 
 if (!email || !isValidEmail(email)) {
   console.error(`Usage: node scripts/create-user.mjs <email> [${USER_ROLES.join("|")}]`);

@@ -5,6 +5,7 @@ import {
   clampPageSize,
   DEFAULT_PAGE_SIZE,
   FIRST_CUSTOM_STATUS_ID,
+  MAX_PAGE,
   offsetFor,
   PAGE_SIZES,
   RESULT_STATUS,
@@ -59,5 +60,19 @@ describe("pagination clamps", () => {
     expect(offsetFor(1, 25)).toBe(0);
     expect(offsetFor(3, 25)).toBe(50);
     expect(offsetFor(-9, 25)).toBe(0);
+  });
+});
+
+describe("page ceiling", () => {
+  it("caps an absurd page instead of producing an unbindable offset", () => {
+    expect(clampPage(1e308)).toBe(MAX_PAGE);
+    expect(Number.isSafeInteger(offsetFor(1e308, 25))).toBe(true);
+    expect(Number.isSafeInteger(offsetFor("9007199254740993", 100))).toBe(true);
+  });
+
+  it("clamps the limit itself rather than trusting the caller", () => {
+    expect(offsetFor(2, NaN)).toBe(DEFAULT_PAGE_SIZE);
+    expect(offsetFor(2, 7)).toBe(DEFAULT_PAGE_SIZE);
+    expect(offsetFor(3, 50)).toBe(100);
   });
 });

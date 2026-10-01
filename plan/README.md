@@ -29,7 +29,7 @@ Phase 7 is last.
 
 Phase 6 jumped the queue: the login page was built first, which pulled
 the `users`, `sessions` and `login_attempts` slice of the phase 1 schema
-forward with it. Phase 1 has since landed the rest, at schema version 3.
+forward with it. Phase 1 has since landed the rest, at schema version 4.
 
 ## Scope
 

@@ -4,8 +4,8 @@ Goal: one SQLite module that owns the whole schema, one constants module
 that owns every status/priority/type id, and a test harness that gives
 each test a fresh database. Nothing user-facing ships here.
 
-**Status: done.** Schema version 3: 17 tables, 34 indexes, the five
-built-in statuses seeded. `lib/format.ts` owns the constants. 38 tests
+**Status: done.** Schema version 4: 17 tables, 34 indexes, the five
+built-in statuses seeded. `lib/format.ts` owns the constants. 45 tests
 pass.
 
 | Section | State |
@@ -27,8 +27,13 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - `PRAGMA journal_mode = WAL`, `PRAGMA foreign_keys = ON`. Both on every
   connection — foreign keys are off by default in SQLite and silently
   so.
-- Single `db.exec(SCHEMA)` block on first open, guarded by a
-  `schema_version` table.
+- `schema_version` is created and read **before** any other DDL runs, so a
+  database from another build is refused without being touched. Creating
+  its missing tables first and complaining afterwards is exactly the
+  half-working this guard exists to prevent.
+- A failed open closes the handle. `getDb` does not cache a failure, so
+  without that every request against a stale file would leak another
+  handle and its WAL lock.
 - The auth tables shipped first, at version 2, because the login page
   needed them. Version 3 adds the rest. A mismatched stamp throws on
   open, so an old `data.db` fails loud instead of half-working. Until
@@ -37,7 +42,7 @@ Done when: `npm run test` runs real tests against a temp DB, and
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
-## 2. Schema v3
+## 2. Schema v4
 
 All tables created up front even though phases 2 and 3 fill them — one
 `db.exec`, one review.
@@ -90,9 +95,16 @@ import_runs     id, source, started_on, finished_on, state, cursor JSON,
 - `results.status_id` and `tests.status_id` are real foreign keys onto
   `statuses`, so a result can never reference a status that does not
   exist. The five built-ins are seeded on open at TestRail's ids.
-- `CHECK` constraints on `role`, `suite_mode` and section `depth`. The
-  phase 4 import writes these columns from somebody else's data; an
-  application-layer check alone would not hold.
+- `CHECK` constraints on `role`, `suite_mode`, section `depth` and
+  attachment `entity_type`, every one interpolated from the matching
+  constant in `lib/format.ts` at module load. The phase 4 import writes
+  these columns from somebody else's data; an application-layer check
+  alone would not hold, and a hand-written value list drifts from its
+  constant in silence.
+- `cases`, `tests` and `results` use `AUTOINCREMENT`. SQLite otherwise
+  reuses `max(rowid) + 1`, and because `attachments` is polymorphic with
+  no foreign key, a new case landing on a deleted case's id would
+  silently inherit its files.
 - `tests.status_id` is a denormalised cache of the latest result. It is
   written only by the same transaction that inserts a result (phase 3),
   never by hand.
@@ -131,8 +143,18 @@ Shared client+server. No DB import.
   TestRail admin can add, rename and reorder both, so assuming the ids
   line up would be inventing data. The import reads `get_priorities`
   and `get_case_types` and translates in `lib/migrate/map.ts`.
-- `PAGE_SIZES = [25, 50, 100]`, `clampPageSize`, `clampPage`. Every list
-  query in every later phase uses these — no second pager.
+- `PAGE_SIZES = [25, 50, 100]`, `clampPageSize`, `clampPage`,
+  `offsetFor`. Every list query in every later phase uses these — no
+  second pager. `clampPage` has a `MAX_PAGE` ceiling: unbounded, an
+  absurd `?page=` multiplies into an offset SQLite cannot bind, and the
+  route 500s instead of returning an empty page. `offsetFor` clamps both
+  of its arguments itself rather than trusting the caller to have done
+  it.
+- `MAX_SECTION_LEVELS`, named for levels rather than for a maximum depth
+  because `depth` is 0-indexed. `depth <= MAX_SECTION_DEPTH` is the
+  guard a reader writes by reflex, and it is off by one against the
+  CHECK — hence the name.
+- `ATTACHMENT_ENTITIES`, interpolated into the `entity_type` CHECK.
 - Shared TS types for every row above. Rows are plain objects; no
   classes.
 

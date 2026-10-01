@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import {
   clearLoginAttempts,
   countLoginAttempts,
   countUsers,
   createUser,
+  deleteExpiredLoginAttempts,
   deleteExpiredSessions,
   deleteSession,
   findSessionUser,
@@ -17,7 +18,7 @@ import {
   openDb,
   SCHEMA_VERSION,
 } from "./db";
-import { MAX_SECTION_DEPTH, RESULT_STATUS } from "./format";
+import { MAX_SECTION_LEVELS, RESULT_STATUS } from "./format";
 
 let directory: string;
 let database: Database.Database;
@@ -67,6 +68,25 @@ describe("schema", () => {
     stale.close();
     expect(() => openDb(file)).toThrow(/schema is version/i);
   });
+
+  it("refuses a stale database without touching it", () => {
+    const file = join(directory, "untouched.db");
+    const stale = openDb(file);
+    stale.prepare("UPDATE schema_version SET version = ?").run(SCHEMA_VERSION - 1);
+    stale.prepare("DROP TABLE results").run();
+    stale.close();
+
+    expect(() => openDb(file)).toThrow(/schema is version/i);
+
+    // Re-reading has to go through a raw connection: openDb refuses this file.
+    const inspect = new Database(file);
+    const recreated = inspect
+      .prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE name = 'results'")
+      .get() as { total: number };
+    inspect.close();
+    expect(recreated.total).toBe(0);
+  });
+
 });
 
 describe("statuses", () => {
@@ -77,6 +97,27 @@ describe("statuses", () => {
     expect(rows.map((row) => row.id)).toEqual([1, 2, 3, 4, 5]);
     expect(rows[0].system_name).toBe("passed");
     expect(rows[4].system_name).toBe("failed");
+  });
+
+  it("rejects a custom status that takes a built-in name", () => {
+    expect(() =>
+      database
+        .prepare("INSERT INTO statuses (id, system_name, label) VALUES (9, 'passed', 'Passed?')")
+        .run(),
+    ).toThrow(/UNIQUE/i);
+  });
+
+  it("carries a corrected label into an existing database", () => {
+    const file = join(directory, "relabel.db");
+    const first = openDb(file);
+    first.prepare("UPDATE statuses SET label = 'Wrong' WHERE id = 1").run();
+    first.close();
+    const second = openDb(file);
+    const row = second.prepare("SELECT label FROM statuses WHERE id = 1").get() as {
+      label: string;
+    };
+    second.close();
+    expect(row.label).toBe("Passed");
   });
 
   it("does not duplicate them when the database is reopened", () => {
@@ -213,12 +254,47 @@ describe("structural integrity", () => {
     ).toThrow(/FOREIGN KEY/i);
   });
 
-  it("caps section nesting at the documented depth", () => {
+  it("allows the deepest legal section and rejects one below it", () => {
     const { suiteId } = seedTree();
+    const insert = database.prepare(
+      "INSERT INTO sections (suite_id, name, depth) VALUES (?, 'deep', ?)",
+    );
+    expect(() => insert.run(suiteId, MAX_SECTION_LEVELS - 1)).not.toThrow();
+    expect(() => insert.run(suiteId, MAX_SECTION_LEVELS)).toThrow(/CHECK/i);
+  });
+
+  it("never re-uses the id of a deleted case, so attachments cannot be inherited", () => {
+    const { suiteId, sectionId, caseId } = seedTree();
+    database
+      .prepare(
+        `INSERT INTO attachments (entity_type, entity_id, filename, storage_path, created_on)
+         VALUES ('case', ?, 'secret.pdf', 'a/b', ?)`,
+      )
+      .run(caseId, nowSeconds());
+    database.prepare("DELETE FROM cases WHERE id = ?").run(caseId);
+
+    const replacement = database
+      .prepare(
+        `INSERT INTO cases (section_id, suite_id, title, created_on, updated_on)
+         VALUES (?, ?, 'A different case', ?, ?)`,
+      )
+      .run(sectionId, suiteId, nowSeconds(), nowSeconds());
+
+    expect(Number(replacement.lastInsertRowid)).not.toBe(caseId);
+    const inherited = database
+      .prepare("SELECT COUNT(*) AS total FROM attachments WHERE entity_type = 'case' AND entity_id = ?")
+      .get(Number(replacement.lastInsertRowid)) as { total: number };
+    expect(inherited.total).toBe(0);
+  });
+
+  it("rejects an attachment on an entity type that cannot have one", () => {
     expect(() =>
       database
-        .prepare("INSERT INTO sections (suite_id, name, depth) VALUES (?, 'too deep', ?)")
-        .run(suiteId, MAX_SECTION_DEPTH),
+        .prepare(
+          `INSERT INTO attachments (entity_type, entity_id, filename, storage_path, created_on)
+           VALUES ('project', 1, 'f.pdf', 'a/b', ?)`,
+        )
+        .run(nowSeconds()),
     ).toThrow(/CHECK/i);
   });
 
@@ -301,6 +377,21 @@ describe("login attempts", () => {
       .prepare("INSERT INTO login_attempts (identifier, attempted_on) VALUES (?, ?)")
       .run("email:a@example.com", nowSeconds());
     expect(countLoginAttempts(database, "email:a@example.com", 900)).toBe(1);
+  });
+
+  it("prunes rows that fell out of the window", () => {
+    const insert = database.prepare(
+      "INSERT INTO login_attempts (identifier, attempted_on) VALUES (?, ?)",
+    );
+    insert.run("ip:1.2.3.4", nowSeconds() - 5000);
+    insert.run("ip:5.6.7.8", nowSeconds() - 5000);
+    insert.run("email:a@example.com", nowSeconds());
+
+    expect(deleteExpiredLoginAttempts(database, 900)).toBe(2);
+    const left = database.prepare("SELECT COUNT(*) AS total FROM login_attempts").get() as {
+      total: number;
+    };
+    expect(left.total).toBe(1);
   });
 
   it("clears attempts after a success", () => {
