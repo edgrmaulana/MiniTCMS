@@ -17,6 +17,8 @@ import {
   type AttachmentRow,
   type CaseFieldRow,
   type CaseRow,
+  type ImportRunRow,
+  type ImportState,
   type ListResult,
   type MilestoneRow,
   type PlanRow,
@@ -34,7 +36,7 @@ import {
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -65,6 +67,13 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email  ON users(email);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_source ON users(source, source_id);
+/*
+  An expression index, because the lookup is case-insensitive: a CSV export
+  carries a display name, not an email, and "Ana" has to find "ana". An
+  index on name alone cannot answer lower(name) = ? and the query scanned
+  the table - 261us over 500 users, growing with the user list. Seek: 44us.
+*/
+CREATE INDEX IF NOT EXISTS idx_users_name_lower ON users(lower(name));
 
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
@@ -320,6 +329,14 @@ CREATE TABLE IF NOT EXISTS import_runs (
   report      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_import_runs_state ON import_runs(state, started_on DESC);
+/*
+  idx_import_runs_state leads on state, so it cannot answer the list's
+  ORDER BY started_on and every page sorted the whole table through USE TEMP
+  B-TREE FOR ORDER BY - 820us a page over 5000 imports. With this, 78us and
+  flat. The id tiebreak is there because imports started in the same second
+  would otherwise come back in an undefined order.
+*/
+CREATE INDEX IF NOT EXISTS idx_import_runs_recent ON import_runs(started_on DESC, id DESC);
 `;
 
 export function openDb(file: string): Database.Database {
@@ -947,7 +964,16 @@ export function upsertCaseField(
     source?: string | null;
     sourceId?: number | null;
   },
-): number {
+): UpsertResult {
+  const before = database
+    .prepare("SELECT id, label, type, is_global, configs FROM case_fields WHERE system_name = ?")
+    .get(field.systemName) as
+    | { id: number; label: string; type: string; is_global: number; configs: string | null }
+    | undefined;
+
+  const isGlobal = field.isGlobal === false ? 0 : 1;
+  const configs = field.configs ?? null;
+
   database
     .prepare(
       `INSERT INTO case_fields (system_name, label, type, is_global, configs, source, source_id)
@@ -962,18 +988,35 @@ export function upsertCaseField(
       field.systemName,
       field.label,
       field.type,
-      field.isGlobal === false ? 0 : 1,
-      field.configs ?? null,
+      isGlobal,
+      configs,
       field.source ?? null,
       field.sourceId ?? null,
     );
-  // Read the id back rather than trusting lastInsertRowid: on the DO UPDATE
-  // branch nothing was inserted and that value is left over from whatever this
-  // connection inserted last, in whatever table.
-  const row = database
-    .prepare("SELECT id FROM case_fields WHERE system_name = ?")
-    .get(field.systemName) as { id: number };
-  return row.id;
+
+  if (!before) {
+    /*
+      Read the id back rather than trusting lastInsertRowid: this function
+      has two branches and on the DO UPDATE one that value is left over from
+      whatever this connection inserted last, in whatever table.
+    */
+    const inserted = database
+      .prepare("SELECT id FROM case_fields WHERE system_name = ?")
+      .get(field.systemName) as { id: number };
+    return { id: inserted.id, action: "inserted" };
+  }
+
+  /*
+    The import reports "second run changed nothing", which only means
+    something if unchanged is counted apart from updated - so the comparison
+    happens here rather than being approximated by the caller.
+  */
+  const changed =
+    before.label !== field.label ||
+    before.type !== field.type ||
+    before.is_global !== isGlobal ||
+    before.configs !== configs;
+  return { id: before.id, action: changed ? "updated" : "unchanged" };
 }
 
 export type CaseFilter = ListOptions & {
@@ -2059,4 +2102,557 @@ export function listAttachments(
       "SELECT * FROM attachments WHERE entity_type = ? AND entity_id = ? ORDER BY created_on, id",
     )
     .all(entityType, entityId) as AttachmentRow[];
+}
+
+/* ------------------------------------------------------------------ *
+ * Migration
+ *
+ * Everything an import needs that the normal CRUD path cannot give it:
+ * upserts keyed on (source, source_id), the lookups that resolve a
+ * TestRail row to one of ours, and the import_runs bookkeeping that makes
+ * a half-finished import resumable.
+ *
+ * The upserts report which of the three things happened, because the
+ * acceptance test for the whole phase is that a second identical import
+ * writes nothing: "inserted 0, updated 0" is only meaningful if unchanged
+ * is counted separately (plan/04-testrail-migration.md section 5).
+ * ------------------------------------------------------------------ */
+
+export type UpsertAction = "inserted" | "updated" | "unchanged";
+
+export type UpsertResult = { id: number; action: UpsertAction };
+
+/*
+  Every table an import writes into, with the columns the import owns.
+
+  One generated statement per table rather than eleven hand-written ones: the
+  shape is identical every time - insert, conflict on (source, source_id),
+  update only the columns that actually differ - and eleven copies of it is
+  eleven places for one of the OR clauses to go missing, which reads as
+  "unchanged" and silently stops updating that column forever.
+
+  Every identifier here is a literal in this file. Nothing in this map is
+  ever built from a request value.
+
+  `insertOnly` is written once and never compared. Every `created_on` is in
+  there, and that is not a detail: a source row that carries no creation
+  date falls back to the clock, and a clock in the comparison means the row
+  reports "updated" on every single import and its dates walk forward by
+  the length of the gap. Measured: a CSV with no `Created On` column
+  rewrote all 243 timestamps on the second pass.
+
+  `cases.is_deleted` is deliberately absent: a case deleted here stays
+  deleted when the import is replayed. Re-importing is not an undelete.
+*/
+export type ImportTable =
+  | "users"
+  | "projects"
+  | "suites"
+  | "sections"
+  | "milestones"
+  | "cases"
+  | "plans"
+  | "runs"
+  | "tests"
+  | "results";
+
+const IMPORT_COLUMNS: Record<
+  ImportTable,
+  { set: readonly string[]; insertOnly?: readonly string[] }
+> = {
+  users: { set: ["email", "name", "role", "is_active"], insertOnly: ["created_on"] },
+  projects: {
+    set: ["name", "announcement", "suite_mode", "is_completed"],
+    insertOnly: ["created_on"],
+  },
+  suites: { set: ["project_id", "name", "description", "is_baseline", "baseline_of"] },
+  sections: {
+    set: ["suite_id", "parent_id", "depth", "display_order", "name", "description"],
+  },
+  milestones: {
+    set: [
+      "project_id",
+      "parent_id",
+      "name",
+      "description",
+      "due_on",
+      "started_on",
+      "is_completed",
+    ],
+  },
+  cases: {
+    set: [
+      "section_id",
+      "suite_id",
+      "title",
+      "template_id",
+      "type_id",
+      "priority_id",
+      "refs",
+      "estimate",
+      "milestone_id",
+      "custom",
+      "created_by",
+      "updated_by",
+      "updated_on",
+    ],
+    insertOnly: ["created_on"],
+  },
+  plans: {
+    set: ["project_id", "name", "description", "milestone_id", "is_completed"],
+    insertOnly: ["created_on"],
+  },
+  runs: {
+    set: [
+      "project_id",
+      "suite_id",
+      "plan_id",
+      "milestone_id",
+      "name",
+      "description",
+      "config",
+      "include_all",
+      "is_completed",
+    ],
+    insertOnly: ["created_on"],
+  },
+  tests: { set: ["run_id", "case_id", "title_snapshot", "status_id", "assigned_to"] },
+  results: {
+    set: [
+      "test_id",
+      "status_id",
+      "comment",
+      "version",
+      "elapsed",
+      "defects",
+      "assigned_to",
+      "custom",
+      "created_by",
+    ],
+    insertOnly: ["created_on"],
+  },
+};
+
+export type ImportRow = Record<string, string | number | null> & {
+  source: string;
+  source_id: number;
+};
+
+export type ImportWriter = (row: ImportRow) => UpsertResult;
+
+function upsertSql(table: ImportTable): string {
+  const { set, insertOnly = [] } = IMPORT_COLUMNS[table];
+  const inserted = [...set, ...insertOnly, "source", "source_id"];
+  return `INSERT INTO ${table} (${inserted.join(", ")})
+          VALUES (${inserted.map((column) => `@${column}`).join(", ")})
+          ON CONFLICT(source, source_id) DO UPDATE SET
+            ${set.map((column) => `${column} = excluded.${column}`).join(",\n            ")}
+          WHERE ${set.map((column) => `${table}.${column} IS NOT excluded.${column}`).join("\n             OR ")}`;
+}
+
+/*
+  Statements are compiled per connection, and an import calls these hundreds
+  of thousands of times, so they are prepared once and kept against the
+  connection. A WeakMap so a closed test database is still collectable.
+*/
+const preparedWriters = new WeakMap<
+  Database.Database,
+  Map<ImportTable, { probe: Database.Statement; upsert: Database.Statement }>
+>();
+
+function statementsFor(
+  database: Database.Database,
+  table: ImportTable,
+): { probe: Database.Statement; upsert: Database.Statement } {
+  let byTable = preparedWriters.get(database);
+  if (!byTable) {
+    byTable = new Map();
+    preparedWriters.set(database, byTable);
+  }
+  const existing = byTable.get(table);
+  if (existing) return existing;
+
+  const prepared = {
+    probe: database.prepare(`SELECT id FROM ${table} WHERE source = ? AND source_id = ?`),
+    upsert: database.prepare(upsertSql(table)),
+  };
+  byTable.set(table, prepared);
+  return prepared;
+}
+
+/*
+  The probe is what separates "inserted" from "updated": `changes` reports 1
+  for both, and 0 only when the conflict matched and nothing differed. It
+  costs one seek on a UNIQUE index the schema already keeps.
+*/
+export function importWriter(database: Database.Database, table: ImportTable): ImportWriter {
+  const { probe, upsert } = statementsFor(database, table);
+  return (row) => {
+    const existing = probe.get(row.source, row.source_id) as { id: number } | undefined;
+    const info = upsert.run(row);
+    if (existing === undefined) {
+      return { id: Number(info.lastInsertRowid), action: "inserted" };
+    }
+    return { id: existing.id, action: info.changes > 0 ? "updated" : "unchanged" };
+  };
+}
+
+export function upsertFromSource(
+  database: Database.Database,
+  table: ImportTable,
+  row: ImportRow,
+): UpsertResult {
+  return importWriter(database, table)(row);
+}
+
+/*
+  Users are the one import whose natural key is not (source, source_id): a
+  TestRail user and a MiniTCMS user are the same person when the email
+  matches, and `users.email` is UNIQUE. So an existing local account is
+  claimed - stamped with the source so later imports find it by id - rather
+  than inserted a second time and rejected.
+
+  `password_hash` is never touched: an imported account cannot sign in until
+  somebody sets a password, and re-importing must not lock out a user who
+  already has one.
+*/
+export function upsertUserFromSource(
+  database: Database.Database,
+  user: {
+    email: string;
+    name: string | null;
+    role: UserRole;
+    isActive: boolean;
+    source: string;
+    sourceId: number;
+  },
+): UpsertResult {
+  const email = normaliseEmail(user.email);
+  const bySource = database
+    .prepare("SELECT id FROM users WHERE source = ? AND source_id = ?")
+    .get(user.source, user.sourceId) as { id: number } | undefined;
+
+  if (!bySource) {
+    const byEmail = database.prepare("SELECT id, source FROM users WHERE email = ?").get(email) as
+      | { id: number; source: string | null }
+      | undefined;
+    if (byEmail) {
+      const claimed = database
+        .prepare(
+          `UPDATE users SET name = COALESCE(?, name), source = ?, source_id = ?
+            WHERE id = ? AND (name IS NOT ? OR source IS NOT ? OR source_id IS NOT ?)`,
+        )
+        .run(
+          user.name,
+          user.source,
+          user.sourceId,
+          byEmail.id,
+          user.name,
+          user.source,
+          user.sourceId,
+        );
+      return { id: byEmail.id, action: claimed.changes > 0 ? "updated" : "unchanged" };
+    }
+  }
+
+  return upsertFromSource(database, "users", {
+    email,
+    name: user.name,
+    // Least privilege: TestRail's role ids are instance-specific, so an
+    // imported account gets the lowest role and the mapping is reported.
+    role: user.role,
+    is_active: user.isActive ? 1 : 0,
+    created_on: nowSeconds(),
+    source: user.source,
+    source_id: user.sourceId,
+  });
+}
+
+/*
+  Statuses are the one table keyed on TestRail's own id by construction
+  (phase 1 pinned 1-5 to TestRail's). A custom status arrives at id >= 6 and
+  is written as it is, so an imported status looks like itself everywhere
+  without a translation table.
+*/
+export function upsertStatus(
+  database: Database.Database,
+  status: {
+    id: number;
+    systemName: string;
+    label: string;
+    color: string | null;
+    isUntested: boolean;
+    isFinal: boolean;
+  },
+): UpsertResult {
+  const existing = database.prepare("SELECT id FROM statuses WHERE id = ?").get(status.id) as
+    | { id: number }
+    | undefined;
+  const info = database
+    .prepare(
+      `INSERT INTO statuses (id, system_name, label, color, is_untested, is_final)
+       VALUES (@id, @systemName, @label, @color, @isUntested, @isFinal)
+       ON CONFLICT(id) DO UPDATE SET
+         system_name = excluded.system_name,
+         label       = excluded.label,
+         color       = excluded.color,
+         is_untested = excluded.is_untested,
+         is_final    = excluded.is_final
+       WHERE statuses.system_name IS NOT excluded.system_name
+          OR statuses.label       IS NOT excluded.label
+          OR statuses.color       IS NOT excluded.color
+          OR statuses.is_untested IS NOT excluded.is_untested
+          OR statuses.is_final    IS NOT excluded.is_final`,
+    )
+    .run({
+      id: status.id,
+      systemName: status.systemName,
+      label: status.label,
+      color: status.color,
+      isUntested: status.isUntested ? 1 : 0,
+      isFinal: status.isFinal ? 1 : 0,
+    });
+  if (!existing) return { id: status.id, action: "inserted" };
+  return { id: status.id, action: info.changes > 0 ? "updated" : "unchanged" };
+}
+
+export function upsertSuiteFromSource(
+  database: Database.Database,
+  suite: {
+    projectId: number;
+    name: string;
+    description?: string | null;
+    isBaseline?: boolean;
+    baselineOf?: number | null;
+    source: string;
+    sourceId: number;
+  },
+): UpsertResult {
+  return upsertFromSource(database, "suites", {
+    project_id: suite.projectId,
+    name: suite.name,
+    description: suite.description ?? null,
+    is_baseline: suite.isBaseline ? 1 : 0,
+    baseline_of: suite.baselineOf ?? null,
+    source: suite.source,
+    source_id: suite.sourceId,
+  });
+}
+
+export type ImportCaseInput = {
+  sectionId: number | null;
+  suiteId: number;
+  title: string;
+  templateId: number;
+  typeId: number | null;
+  priorityId: number | null;
+  refs: string | null;
+  estimate: string | null;
+  milestoneId: number | null;
+  custom: string | null;
+  createdBy: number | null;
+  createdOn: number;
+  updatedBy: number | null;
+  /* null means the source carried no modification date - see
+     existingCaseUpdatedOn for why that is not the same as "now". */
+  updatedOn: number | null;
+  source: string;
+  sourceId: number;
+};
+
+export function caseImportRow(input: ImportCaseInput): ImportRow {
+  return {
+    section_id: input.sectionId,
+    suite_id: input.suiteId,
+    title: input.title,
+    template_id: input.templateId,
+    type_id: input.typeId,
+    priority_id: input.priorityId,
+    refs: input.refs,
+    estimate: input.estimate,
+    milestone_id: input.milestoneId,
+    custom: input.custom,
+    created_by: input.createdBy,
+    created_on: input.createdOn,
+    updated_by: input.updatedBy,
+    updated_on: input.updatedOn ?? input.createdOn,
+    source: input.source,
+    source_id: input.sourceId,
+  };
+}
+
+export function upsertCaseFromSource(
+  database: Database.Database,
+  input: ImportCaseInput,
+): UpsertResult {
+  const updatedOn =
+    input.updatedOn ??
+    existingCaseUpdatedOn(database, input.source, input.sourceId) ??
+    input.createdOn;
+  return upsertFromSource(database, "cases", caseImportRow({ ...input, updatedOn }));
+}
+
+/*
+  TestRail ids resolved to ours, for one source, in one query. The import
+  keeps it in memory for the length of the run so a parent reference is a Map
+  lookup rather than a query per row, and a resumed import rebuilds it from
+  the database instead of from the fetched pages.
+
+  Memory ceiling: one entry per imported row, so roughly 20MB of Map for a
+  200k-case instance. Bounded by the instance, not by the import.
+*/
+export function sourceIdMap(
+  database: Database.Database,
+  table: ImportTable,
+  source: string,
+): Map<number, number> {
+  const rows = database
+    .prepare(`SELECT source_id, id FROM ${table} WHERE source = ?`)
+    .all(source) as { source_id: number; id: number }[];
+  return new Map(rows.map((row) => [row.source_id, row.id]));
+}
+
+/*
+  Every section in a suite, flat, for the importer to fold into a
+  path -> id map in one pass. A CSV carries no section ids, so the only key
+  a second import can match on is the resolved path - and resolving it one
+  `SELECT … WHERE name = ?` at a time is a query per path per import.
+*/
+export function listSectionsFlat(
+  database: Database.Database,
+  suiteId: number,
+): { id: number; parent_id: number | null; name: string }[] {
+  /*
+    Ordered by id so two siblings sharing a name resolve the same way every
+    time. TestRail allows duplicate section names under one parent, and the
+    importer keys on the resolved path - without an order, which of the two
+    a case is filed under is whatever SQLite happened to return, and it can
+    differ between imports of the same file.
+  */
+  return database
+    .prepare("SELECT id, parent_id, name FROM sections WHERE suite_id = ? ORDER BY id")
+    .all(suiteId) as { id: number; parent_id: number | null; name: string }[];
+}
+
+/*
+  Identity in a CSV is a display name, not an email, so a match is only
+  accepted when it is unique. Two rows back means ambiguous, and the caller
+  leaves the column NULL and reports it rather than picking one. LIMIT 2
+  because the third match tells us nothing the second did not.
+*/
+export function findUserIdsByName(database: Database.Database, name: string): number[] {
+  const rows = database
+    .prepare("SELECT id FROM users WHERE lower(name) = lower(?) LIMIT 2")
+    .all(name) as { id: number }[];
+  return rows.map((row) => row.id);
+}
+
+/*
+  The trap in plan section 6.7: `UNIQUE(source, source_id)` is per source, so
+  importing a CSV and then the API lands every case twice and the schema
+  cannot see it. The importer asks this first and refuses unless the operator
+  passes --allow-mixed-sources.
+*/
+/*
+  30-40ms over 200k cases, through a temp B-tree for the GROUP BY.
+  Deliberately left that way: it runs once per import, not once per row, and
+  the only index that would remove the sort would exist for this one query.
+*/
+export function caseSourcesInProject(
+  database: Database.Database,
+  projectId: number,
+): { source: string | null; total: number }[] {
+  return database
+    .prepare(
+      `SELECT cases.source AS source, COUNT(*) AS total
+         FROM cases
+         JOIN suites ON suites.id = cases.suite_id
+        WHERE suites.project_id = ?
+        GROUP BY cases.source`,
+    )
+    .all(projectId) as { source: string | null; total: number }[];
+}
+
+/*
+  What this row's updated_on already is, for an import whose source did not
+  send one. "No information" has to mean "leave it alone": falling back to
+  the clock makes the row differ from itself on every pass. Only read when
+  the source actually omitted the field, which is rare.
+*/
+export function existingCaseUpdatedOn(
+  database: Database.Database,
+  source: string,
+  sourceId: number,
+): number | undefined {
+  const row = database
+    .prepare("SELECT updated_on FROM cases WHERE source = ? AND source_id = ?")
+    .get(source, sourceId) as { updated_on: number } | undefined;
+  return row?.updated_on;
+}
+
+export function createImportRun(database: Database.Database, source: string): number {
+  const result = database
+    .prepare("INSERT INTO import_runs (source, state, started_on) VALUES (?, 'running', ?)")
+    .run(source, nowSeconds());
+  return Number(result.lastInsertRowid);
+}
+
+export function updateImportRun(
+  database: Database.Database,
+  id: number,
+  patch: { state?: ImportState; cursor?: string | null; report?: string | null },
+): void {
+  // finished_on is derived from the state rather than passed in, so a run
+  // cannot be recorded as done with no end time.
+  const finished = patch.state === "done" || patch.state === "failed" ? nowSeconds() : null;
+  const result = database
+    .prepare(
+      `UPDATE import_runs
+          SET state       = COALESCE(?, state),
+              cursor      = CASE WHEN ? THEN ? ELSE cursor END,
+              report      = CASE WHEN ? THEN ? ELSE report END,
+              finished_on = COALESCE(?, finished_on)
+        WHERE id = ?`,
+    )
+    .run(
+      patch.state ?? null,
+      patch.cursor === undefined ? 0 : 1,
+      patch.cursor ?? null,
+      patch.report === undefined ? 0 : 1,
+      patch.report ?? null,
+      finished,
+      id,
+    );
+  assertChanged(result.changes, "import run", id);
+}
+
+export function getImportRun(
+  database: Database.Database,
+  id: number,
+): ImportRunRow | undefined {
+  return database.prepare("SELECT * FROM import_runs WHERE id = ?").get(id) as
+    | ImportRunRow
+    | undefined;
+}
+
+/*
+  No `search` here, unlike the other lists: an import run has no name to
+  search, and accepting a parameter that is silently dropped reads as a
+  filter that works.
+*/
+export function listImportRuns(
+  database: Database.Database,
+  options: { limit?: unknown; page?: unknown } = {},
+): ListResult<ImportRunRow> {
+  const total = (
+    database.prepare("SELECT COUNT(*) AS total FROM import_runs").get() as { total: number }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT * FROM import_runs
+        ORDER BY started_on DESC, id DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(clampPageSize(options.limit), offsetFor(options.page, options.limit)) as ImportRunRow[];
+  return paged(rows, total, options);
 }

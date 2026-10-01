@@ -633,13 +633,22 @@ describe("case repository", () => {
       type: "text",
       source: "testrail-csv",
     });
+    expect(first.action).toBe("inserted");
     const second = upsertCaseField(database, {
       systemName: "platform",
       label: "Platform",
       type: "dropdown",
       configs: JSON.stringify({ options: { items: ["API"] } }),
     });
-    expect(second).toBe(first);
+    expect(second.id).toBe(first.id);
+    expect(second.action).toBe("updated");
+    const third = upsertCaseField(database, {
+      systemName: "platform",
+      label: "Platform",
+      type: "dropdown",
+      configs: JSON.stringify({ options: { items: ["API"] } }),
+    });
+    expect(third.action).toBe("unchanged");
     expect(listCaseFields(database)).toHaveLength(1);
     expect(listCaseFields(database)[0].type).toBe("dropdown");
   });
