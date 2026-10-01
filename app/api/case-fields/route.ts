@@ -29,7 +29,7 @@ export async function POST(request: Request): Promise<Response> {
     if (body.configs !== undefined && typeof body.configs !== "string") {
       throw new BadRequestError("configs must be a JSON string");
     }
-    const id = upsertCaseField(getDb(), {
+    const { id } = upsertCaseField(getDb(), {
       systemName: requireText(body.systemName, "systemName"),
       label: requireText(body.label, "label"),
       type,

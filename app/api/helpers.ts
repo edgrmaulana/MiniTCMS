@@ -2,6 +2,7 @@ import { currentUser } from "@/lib/session";
 import { CaseFieldError, type SessionUser, type UserRole } from "@/lib/format";
 import { AttachmentTooLargeError } from "@/lib/attachments";
 import { ConflictError, MAX_BULK_IDS, NotFoundError } from "@/lib/db";
+import { MappingError } from "@/lib/migrate/map";
 
 /*
   Thin routes (AGENTS.md rule 6): everything the handlers share lives here. Validate, delegate to lib/db.ts, return. No SQL above this
@@ -54,6 +55,9 @@ export async function handle(work: () => Promise<Response>): Promise<Response> {
     if (error instanceof ConflictError) return problem(409, error.message);
     if (error instanceof BadRequestError) return problem(400, error.message);
     if (error instanceof CaseFieldError) return problem(400, error.message);
+    // A mapping failure names the source row, which is exactly what the
+    // operator needs to see; it is a bad input, not a server fault.
+    if (error instanceof MappingError) return problem(400, error.message);
     console.error(error);
     return problem(500, "Something went wrong");
   }
