@@ -13,7 +13,12 @@ repo are in [`AGENTS.md`](AGENTS.md).
 
 ```bash
 npm install
-npm run dev
+
+# Create the first account. The password is read from stdin, so it never
+# lands in your shell history. Minimum 12 characters.
+npm run user:add -- you@example.com admin
+
+npm run dev          # http://localhost:3000/login
 ```
 
 ```bash
@@ -21,6 +26,16 @@ npm run test
 npm run lint
 npm run build
 ```
+
+`SQLITE_FILE` overrides the database path (default `./data.db`).
+
+## Sign-in
+
+Email and password, sessions in SQLite, scrypt hashes, one deliberately
+vague error message. There is no self-service signup: accounts come from
+`npm run user:add` or from the TestRail import. What is built and what
+is not is listed in
+[`plan/06-auth-and-api.md`](plan/06-auth-and-api.md).
 
 ## TestRail migration
 

@@ -17,11 +17,15 @@ and *when*; AGENTS.md is the *how*.
 | 3 | `03-execution.md` | Milestones, plans, runs, tests, append-only results |
 | 4 | `04-testrail-migration.md` | TestRail client, field mapping, resumable import, report |
 | 5 | `05-ui.md` | App shell and the five screens that make it usable |
-| 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters |
+| 6 | `06-auth-and-api.md` | Login (shipped), roles, public REST API, CI reporters |
 | 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 |
 
 Phases 1→4 are strictly ordered. Phase 5 can start once phase 2 lands.
-Phase 6 and 7 are last and can overlap.
+Phase 7 is last.
+
+Phase 6 jumped the queue: the login page is built, which pulled the
+`users`, `sessions` and `login_attempts` slice of the phase 1 schema
+forward with it. Phase 1 extends that file rather than creating it.
 
 ## Scope
 
@@ -47,6 +51,12 @@ the whole target.
   latest result.
 - **No ORM.** Hand-written SQL in `lib/db.ts`. The schema is ~15 tables
   and it is not going to surprise anyone.
+- **Sessions in the database, not a JWT.** Only the token hash is
+  stored, so revocation is a `DELETE` and a leaked database dump does
+  not hand over live logins. Details in `06-auth-and-api.md`.
+- **The visual language is set by the login page**: night-sky palette,
+  Archivo for UI, Fraunces for display, all as CSS variables in
+  `app/globals.css`. Phase 5 inherits it rather than re-deciding.
 
 ## Open questions
 

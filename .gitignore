@@ -48,3 +48,11 @@ data.db-shm
 # IDE
 .idea/
 *.iml
+
+# Environment
+.env
+.env.local
+
+# Vendored agent skills (third-party, decide before publishing)
+.agents/
+skills-lock.json

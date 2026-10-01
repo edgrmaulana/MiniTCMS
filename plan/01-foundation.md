@@ -14,7 +14,13 @@ Done when: `npm run test` runs real tests against a temp DB, and
   connection — foreign keys are off by default in SQLite and silently
   so.
 - Single `db.exec(SCHEMA)` block on first open, guarded by a
-  `schema_version` table. Version 1 is this phase.
+  `schema_version` table.
+- **Already shipped, out of order:** `lib/db.ts` exists at schema
+  version 1 with `users`, `sessions` and `login_attempts`, because the
+  login page in `06-auth-and-api.md` needed them. This phase extends
+  that file to version 2 with the tables below and bumps
+  `SCHEMA_VERSION`. A mismatched stamp already throws on open, so an old
+  `data.db` fails loud instead of half-working.
 - Module-level singleton connection. Next.js dev reloads: stash it on
   `globalThis` so hot reload does not open a new handle per edit.
 
@@ -49,8 +55,10 @@ results         id, test_id, status_id, comment, version, elapsed,
                 created_on, source, source_id
 attachments     id, entity_type, entity_id, filename, mime, size,
                 storage_path, source, source_id
-users           id, email, name, role, is_active, password_hash,
-                source, source_id
+users           DONE: id, email, name, role, is_active, password_hash,
+                created_on, source, source_id
+sessions        DONE: token_hash, user_id, created_on, expires_on, user_agent
+login_attempts  DONE: id, identifier, attempted_on
 statuses        id, system_name, label, color, is_untested, is_final
 import_runs     id, source, started_on, finished_on, state, cursor JSON,
                 report JSON

@@ -1,26 +1,156 @@
 @import "tailwindcss";
 
+/*
+  Aurora over a night sky: deep blue-black ground, one dominant teal, a cold
+  violet mid, and a single sharp magenta reserved for errors and focus.
+*/
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --night:      #05080f;
+  --night-deep: #03050a;
+  --panel:      #080c16;
+  --ink:        #e8edf7;
+  --muted:      #8793ab;
+  --line:       #1b2335;
+  --aurora:     #2fe0a8;
+  --violet:     #6b6ff0;
+  --alert:      #ff5d8f;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-night: var(--night);
+  --color-panel: var(--panel);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-aurora: var(--aurora);
+  --color-violet: var(--violet);
+  --color-alert: var(--alert);
+  --font-sans: var(--font-archivo);
+  --font-display: var(--font-fraunces);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  color-scheme: dark;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--night);
+  color: var(--ink);
+  font-family: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "ss01", "cv01";
+}
+
+.display {
+  font-family: var(--font-fraunces), Georgia, serif;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+}
+
+.wordmark {
+  font-family: var(--font-archivo), sans-serif;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.26em;
+  text-transform: lowercase;
+  color: var(--muted);
+}
+
+/* Visible before WebGL2 reports in, and the whole hero where it never does. */
+.hero {
+  background:
+    radial-gradient(120% 90% at 18% 112%, rgba(47, 224, 168, 0.22), transparent 60%),
+    radial-gradient(90% 70% at 72% 102%, rgba(107, 111, 240, 0.20), transparent 62%),
+    linear-gradient(180deg, var(--night-deep) 0%, #070d1a 100%);
+}
+
+.hero-copy {
+  text-shadow: 0 1px 24px rgba(3, 5, 10, 0.85);
+}
+
+.panel {
+  background:
+    radial-gradient(100% 60% at 100% 0%, rgba(107, 111, 240, 0.10), transparent 60%),
+    linear-gradient(180deg, var(--panel) 0%, var(--night) 100%);
+  border-left: 1px solid var(--line);
+}
+
+.field {
+  width: 100%;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: rgba(3, 6, 13, 0.72);
+  color: var(--ink);
+  font-size: 0.95rem;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.field::placeholder {
+  color: #4e5a72;
+}
+
+.field:focus-visible {
+  outline: none;
+  border-color: var(--aurora);
+  box-shadow: 0 0 0 3px rgba(47, 224, 168, 0.18);
+}
+
+.field[aria-invalid="true"] {
+  border-color: var(--alert);
+}
+
+.signin {
+  margin-top: 0.25rem;
+  padding: 0.8rem 1rem;
+  border: none;
+  border-radius: 0.5rem;
+  background: linear-gradient(135deg, var(--aurora) 0%, #22b9f0 100%);
+  color: #04120d;
+  font-weight: 600;
+  font-size: 0.95rem;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: filter 140ms ease, transform 140ms ease;
+}
+
+.signin:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.signin:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.signin:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+:focus-visible {
+  outline: 2px solid var(--aurora);
+  outline-offset: 2px;
+}
+
+/* Reveal on load: one staggered entrance beats scattered micro-interactions. */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.panel > div > * {
+  animation: rise 600ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.panel > div > *:nth-child(2) { animation-delay: 70ms; }
+.panel > div > *:nth-child(3) { animation-delay: 110ms; }
+.panel > div > *:nth-child(4) { animation-delay: 160ms; }
+.panel > div > *:nth-child(5) { animation-delay: 220ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .panel > div > * {
+    animation: none;
+  }
+  .signin,
+  .field {
+    transition: none;
+  }
 }
