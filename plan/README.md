@@ -15,8 +15,8 @@ and *when*; AGENTS.md is the *how*.
 | 1 | `01-foundation.md` | SQLite layer, schema, constants, test harness | done |
 | 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields | done |
 | 3 | `03-execution.md` | Runs, test execution, pass/fail/retest/blocked, rollups | done |
-| 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | next |
-| 5 | `05-ui.md` | App shell and the five screens that make it usable | partial |
+| 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | done, bar attachments |
+| 5 | `05-ui.md` | App shell and the five screens that make it usable | next; partial |
 | 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | partial |
 | 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | not started |
 
@@ -29,7 +29,8 @@ Phase 7 is last.
 
 Phase 6 jumped the queue: the login page was built first, which pulled
 the `users`, `sessions` and `login_attempts` slice of the phase 1 schema
-forward with it. Phase 1 has since landed the rest, at schema version 5.
+forward with it. Phase 1 has since landed the rest, and the schema is now at
+version 9.
 
 ## Scope
 
@@ -75,10 +76,17 @@ the whole target.
 
 ## Open questions
 
-- Attachment storage: local disk vs S3-compatible. Default local;
-  decide the interface in phase 3, not before.
-- TestRail "baselines" (`suite_mode` 2): import as plain suites with a
-  `baseline_of` pointer, or flatten? Decide against a real export in
-  phase 4.
+- Attachment storage: local disk vs S3-compatible. **Answered in phase
+  3**: local disk behind `saveAttachment`, `ATTACHMENTS_DIR`, one
+  implementation. Still open is the *import* side — phase 4 brings the
+  rows across but not the bytes, which is a second API call per row and
+  a disk budget nobody has set a number for.
+- TestRail "baselines" (`suite_mode` 2): **still open.** Phase 4 carries
+  the `is_baseline` flag over and leaves `baseline_of` NULL with a
+  report line, because `get_suites` does not say which suite a baseline
+  came from. Nobody has run this against a real mode-2 instance.
+- CSV exports from the Steps template, which spread one case over
+  several rows: phase 4 refuses them rather than reading half. Needs a
+  second real export before it can be built — see `04` section 6.5.
 - BDD/Gherkin case template: TestRail has one, we have no steps parser.
   Likely stored as text in phase 2, structured later if asked.

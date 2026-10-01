@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run --passWithNoTests",
-    "user:add": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/create-user.mjs"
+    "user:add": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/create-user.mjs",
+    "migrate": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/migrate.mjs",
+    "migrate:csv": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/migrate-csv.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

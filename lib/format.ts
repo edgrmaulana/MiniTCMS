@@ -504,6 +504,20 @@ export type AttachmentRow = {
   source_id: number | null;
 };
 
+export const IMPORT_STATES = ["pending", "running", "failed", "done"] as const;
+
+export type ImportState = (typeof IMPORT_STATES)[number];
+
+export type ImportRunRow = {
+  id: number;
+  source: string;
+  state: ImportState;
+  started_on: number;
+  finished_on: number | null;
+  cursor: string | null;
+  report: string | null;
+};
+
 export type ListResult<Row> = {
   rows: Row[];
   total: number;

@@ -6,11 +6,79 @@ data. Treat a lost field as a bug of the same severity as a crash.
 Depends on phases 1-3. Blocks nothing — but nothing else matters if this
 is wrong.
 
-**Status: not started.** No client, no reader, no mapping, no pipeline.
-The one thing already in place is the shape that makes it replayable:
-every importable table carries `(source, source_id)` with a UNIQUE
-index, and `users` already follows it. Schema v5 added `cases.updated_by`
-because both entry points carry it.
+**Status: done, bar attachment bytes.** Both entry points ship: the API
+v2 client with its pipeline, and the CSV reader with its own. 97 new
+tests. Schema v9 added two indexes, both after measuring.
+
+Review found six defects in the first cut, four of them reproduced
+against a database before being fixed and all six with a test:
+
+- A source row carrying no creation date fell back to the clock, and the
+  clock was in the update comparison - so the row reported "updated" on
+  every import and its stored dates walked forward each time. A CSV with
+  no `Created On` column rewrote all 243 timestamps on the second pass.
+  Both entry points had it. `created_on` is now written once and never
+  compared; an absent modification date keeps whatever is stored rather
+  than inventing one.
+- `suite_id` was sent on `get_cases` and `get_sections` for every
+  project. TestRail documents it as optional in single-suite mode -
+  its default - and rejects the call outright on some versions. Now
+  omitted for mode 1.
+- Two sibling sections with the same name, which TestRail allows,
+  resolved to whichever row SQLite returned last. Ordered by id now, and
+  the first one wins.
+- The section path key joined segments with a newline, which a CSV cell
+  can contain. JSON now, so the key cannot be ambiguous.
+- A failed CSV import stored a report holding only the error message,
+  discarding every count and note it had collected - the one outcome
+  `import_runs` exists to prevent.
+- A TestRail comment-only result landed holding `untested`, which
+  everywhere else in this product means "no result exists", with nothing
+  said about it. Reported now.
+
+Verified end to end, twice each. The CSV path ran against the real
+243-case export this project was handed: 243 cases, 56 sections and 15
+custom fields in 69ms, and a second pass reporting zero inserts and zero
+updates. The API path ran against a fake TestRail speaking the real URL
+shape, including `_links.next` pagination over three pages and a 429
+with `Retry-After` — same result on the second pass. **No real TestRail
+instance has been imported yet**, which is the one line of section 9
+still outstanding; a fake server catches a wrong URL shape but not a
+column an instance has that nobody anticipated.
+
+| Section | State |
+|---------|-------|
+| 1 Client | done - `lib/testrail.ts`, throttle, 429, backoff, both page shapes |
+| 2 Read order | done, bar stage 15 |
+| 3 Mapping | done - one pure function per entity in `lib/migrate/map.ts` |
+| 4 Pipeline | done - `lib/migrate/run.ts`, checkpointed per step, `--dry-run` |
+| 5 The report | done - `lib/migrate/report.ts`, reconciliation is a hard failure |
+| 6 CSV import | done, bar 6.5 |
+| 6.5 Steps-template exports | refused loud, as specified; needs a second real export |
+| 7 Interfaces | `npm run migrate`, `npm run migrate:csv`, three routes; the UI is phase 5 |
+| 8 Tests | done |
+| 9 Checks | test, lint and build pass; the live-instance dry run is outstanding |
+
+Three things are deliberately not built, each reported by every import
+that touches them rather than left silent:
+
+- **Attachment bytes.** The rows come across; the files do not. That is
+  a second call per row and a disk budget nobody has set a number for.
+- **`suite_mode` 2 baselines.** `is_baseline` carries over and
+  `baseline_of` stays NULL, because `get_suites` does not say which
+  suite a baseline came from.
+- **Imported roles.** TestRail's role ids are instance-specific and its
+  permission model is not ours, so every imported account lands on
+  `tester` and the report says so. Least privilege beats a guess that
+  mints an admin.
+
+One thing changed shape against the plan below. Section 4 describes the
+cursor as "the last completed stage and the last completed
+(project_id, suite_id, run_id)". What shipped is a set of completed step
+keys - `users`, `project:10:suites`, `suite:20:cases`, `run:70:results`
+- and a resume skips any step already in the set. It is simpler, it is
+order-independent, and it resumes correctly when a project fails halfway
+through a list of projects, which the tuple form does not.
 
 Two entry points, equal weight: the API (sections 1-5) and a CSV case
 export (section 6). The CSV is not a degraded mode — it is what a team

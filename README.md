@@ -7,18 +7,18 @@ Next.js 16 + SQLite. One process, one database file, one container.
 
 ## Status
 
-Early but usable over the API: sign in, build a case tree, create a run
-from it and record pass, fail, retest or blocked against every test.
-The screens are not built yet, so today that means curl or a CI
-reporter.
+Early but usable over the API: sign in, import a TestRail instance or a
+case CSV, build a case tree, create a run from it and record pass, fail,
+retest or blocked against every test. The screens are not built yet, so
+today that means curl, the CLI or a CI reporter.
 
 | Phase | | |
 |---|---|---|
 | 1 | Foundation — SQLite layer, schema, constants, test harness | **done** |
 | 2 | Case repository — projects, suites, sections, cases, custom fields | **done** |
 | 3 | Execution — runs, pass/fail/retest/blocked, append-only results | **done** |
-| 4 | TestRail migration — client, CSV reader, mapping, resumable import | next |
-| 5 | UI — app shell and the five screens | palette and type only |
+| 4 | TestRail migration — client, CSV reader, mapping, resumable import | **done**, bar attachments |
+| 5 | UI — app shell and the five screens | next; palette and type only |
 | 6 | Auth and public API — login, roles, REST API, CI reporters | login done |
 | 7 | Release — Docker, CI, license, contributor docs | not started |
 
@@ -45,6 +45,20 @@ npm run lint
 npm run build
 ```
 
+```bash
+# Import a TestRail instance over the API. Reads credentials from the
+# environment; see Configuration.
+npm run migrate -- --dry-run
+npm run migrate
+npm run migrate -- --resume 3          # continue a run that died
+npm run migrate -- --project 42        # one TestRail project, for a trial
+
+# Import a TestRail case CSV export. --tz and --date-order have no
+# defaults; see the TestRail migration section for why.
+npm run migrate:csv -- export.csv --project 1 --tz Asia/Jakarta \
+  --date-order mdy --dry-run
+```
+
 There is no migration path before the first release. When the schema
 version moves, an older database is refused on open, untouched — delete
 `data.db*` and create your account again.
@@ -57,11 +71,14 @@ version moves, an older database is refused on open, untouched — delete
 | `ATTACHMENTS_DIR` | `./data/attachments` | Where uploaded files are written |
 | `MAX_ATTACHMENT_BYTES` | `33554432` | Upload size cap, 32MB |
 | `TRUSTED_PROXY_HOPS` | `0` | How many reverse proxies you run in front of the app |
-| `TESTRAIL_HOST` | — | e.g. `https://example.testrail.io` (phase 4) |
-| `TESTRAIL_USER` | — | TestRail account email (phase 4) |
-| `TESTRAIL_API_KEY` | — | API key, not a password (phase 4) |
+| `TESTRAIL_HOST` | — | e.g. `https://example.testrail.io` |
+| `TESTRAIL_USER` | — | TestRail account email |
+| `TESTRAIL_API_KEY` | — | API key, not a password |
+| `TESTRAIL_RPS` | `5` | Requests per second ceiling for the import |
 
-TestRail credentials go in `.env.local`, never in the repo.
+TestRail credentials go in `.env.local`, never in the repo. The key is
+an API key, which TestRail issues per user under *My Settings → API
+Keys* — not the account password.
 
 **`TRUSTED_PROXY_HOPS` is a security setting, not a convenience.** Next
 passes the caller's `x-forwarded-for` header straight through rather
@@ -133,7 +150,17 @@ GET                /api/statuses
 GET                /api/tests/[id]/results    the change log, newest first
      POST          /api/attachments           multipart/form-data
 GET                /api/attachments/[id]
+
+GET                /api/migrate               every import, newest first
+GET                /api/migrate/[id]          state, cursor progress, report
+     POST          /api/migrate/csv           multipart/form-data
 ```
+
+The three `/api/migrate` routes need the `admin` or `lead` role. Starting
+an API import is deliberately not a route: it is minutes to hours of work
+against a live instance, which is a terminal job, not a request a browser
+holds open. `npm run migrate` is the interface for it, and
+`GET /api/migrate/[id]` is how a screen watches one.
 
 Lists return `{ rows, total, page, limit }`, where `total` is the count
 before paging. `limit` snaps to 25, 50 or 100 — an arbitrary value is a
@@ -172,7 +199,7 @@ five.
 
 ## Data model
 
-Schema version 8: 17 tables, created in one block and guarded by a
+Schema version 9: 17 tables, created in one block and guarded by a
 stamp that is read before anything else is applied.
 
 ```text
@@ -194,10 +221,69 @@ MIGRATION must be replayable.
 
 ## TestRail migration
 
-Not built yet. The design is in
-[`plan/04-testrail-migration.md`](plan/04-testrail-migration.md): a
-resumable, idempotent import over the TestRail API v2 that is lossless
-or loud — every field either lands or shows up in the report.
+Two entry points of equal weight: the API v2, and a case CSV export. A
+CSV needs no plan tier and no admin willing to issue a key, so it is
+what a team can always produce — it is not a degraded mode and it has
+its own reader and its own mapper.
+
+Both are **idempotent**: every imported row carries `(source, source_id)`
+with a unique index, and import is an upsert on that pair. Running the
+same import twice reports zero inserts and zero updates. Both are
+**resumable**: the API path checkpoints every step in
+`import_runs.cursor`, so `--resume` skips what already landed instead of
+re-reading an instance from the start. Nothing is ever deleted to make an
+import work.
+
+Both print the same report — counts in, counts out, every unmapped field
+and every skipped row — and both fail if the counts do not reconcile.
+A migration that cannot account for every row has not succeeded.
+
+**Nothing is guessed.** A field TestRail did not send is `NULL` and shows
+up in the report. An unknown priority label does not quietly become
+"other"; a result with an unknown status stops the import rather than
+defaulting to untested.
+
+### The CSV needs three things the file cannot say
+
+```bash
+npm run migrate:csv -- export.csv --project 1 --tz Asia/Jakarta --date-order mdy
+```
+
+- `--project` — no column holds it, and it is not inferred from a suite
+  name.
+- `--tz` — `"10/1/2026 6:26 PM"` carries no offset.
+- `--date-order mdy|dmy` — `1/2/2026` is January 2nd or February 1st
+  depending on the exporting user's account settings, and nothing in the
+  file says which. Without both the import refuses to start.
+- `--users "ana=ana@example.com,..."` — optional. A CSV has display
+  names where the API has emails, so a name resolves only on a unique
+  match; anything else leaves the column `NULL` and reports it.
+
+### Do not run both into one project
+
+`UNIQUE(source, source_id)` is per source, and `testrail` and
+`testrail-csv` are different sources — so a CSV import followed by an API
+import would land **every case twice**, and the schema cannot see it.
+Both importers refuse a project that already holds rows from the other
+source and say which, unless `--allow-mixed-sources` is passed. Evaluate
+with the CSV, then start the real API import on a fresh project.
+
+### Not built
+
+- **Attachments.** Rows are imported, but their bytes are not fetched —
+  that is a second call per row and a disk budget nobody has set. Every
+  import says so in its report. A CSV export never had the bytes at all,
+  so a non-empty `Attachments` cell is a reported skip.
+- **Steps-template CSV exports**, which spread one case over several
+  rows. A file with any `Steps (…)` column filled refuses to import
+  rather than reading half of it. API imports carry steps fine.
+- **TestRail `suite_mode` 2 baselines.** The flag carries over;
+  `baseline_of` stays `NULL` and is reported, because `get_suites` does
+  not say which suite a baseline came from and nobody has checked this
+  against a real mode-2 instance.
+- Imported accounts land on the `tester` role. TestRail's role ids are
+  instance-specific and its permission model is not ours, so the import
+  takes least privilege and reports it; promote whoever needs it.
 
 ## License
 
