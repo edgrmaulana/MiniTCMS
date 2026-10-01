@@ -54,6 +54,7 @@ coverage gate, no matrix across four Node versions, no release bot.
 
 ## 5. v0.1.0
 
-Tag when: phases 1-4 work against a real instance, phase 6 auth is on,
-and the Docker image runs clean from the compose file. Phase 5 polish
-and the CSV fallback can land after.
+Tag when: phases 1-4 work against a real instance **and against a real
+CSV export**, phase 6 auth is on, and the Docker image runs clean from
+the compose file. Phase 5 polish can land after. The CSV path is not
+cuttable: for a team without API access it is the whole product.
