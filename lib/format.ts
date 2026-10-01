@@ -184,6 +184,7 @@ export type CaseRow = {
   is_deleted: number;
   created_by: number | null;
   created_on: number;
+  updated_by: number | null;
   updated_on: number;
   source: string | null;
   source_id: number | null;

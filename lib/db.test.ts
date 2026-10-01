@@ -233,6 +233,27 @@ describe("structural integrity", () => {
     expect(test.status_id).toBe(RESULT_STATUS.untested);
   });
 
+  it("keeps a case when the author behind it is deleted", () => {
+    const { caseId } = seedTree();
+    const authorId = Number(
+      database
+        .prepare("INSERT INTO users (email, role, created_on) VALUES (?, ?, ?)")
+        .run("author@example.com", "tester", nowSeconds()).lastInsertRowid,
+    );
+    database
+      .prepare("UPDATE cases SET created_by = ?, updated_by = ? WHERE id = ?")
+      .run(authorId, authorId, caseId);
+
+    database.prepare("DELETE FROM users WHERE id = ?").run(authorId);
+
+    const caseRow = database
+      .prepare("SELECT title, created_by, updated_by FROM cases WHERE id = ?")
+      .get(caseId) as { title: string; created_by: number | null; updated_by: number | null };
+    expect(caseRow.title).toBe("A case");
+    expect(caseRow.created_by).toBeNull();
+    expect(caseRow.updated_by).toBeNull();
+  });
+
   it("refuses a result status that is not a known status", () => {
     const { projectId, suiteId } = seedTree();
     const runId = Number(
