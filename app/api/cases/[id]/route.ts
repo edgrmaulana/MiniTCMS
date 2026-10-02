@@ -6,6 +6,7 @@ import {
   optionalText,
   problem,
   readBody,
+  requireRole,
   requireText,
   requireUser,
   routeId,
@@ -35,7 +36,7 @@ export async function GET(_request: Request, context: Context): Promise<Response
 
 export async function PATCH(request: Request, context: Context): Promise<Response> {
   return handle(async () => {
-    const user = await requireUser();
+    const user = await requireRole("lead");
     const id = routeId((await context.params).id);
     const body = await readBody(request, PATCHABLE);
     updateCase(
@@ -62,7 +63,7 @@ export async function PATCH(request: Request, context: Context): Promise<Respons
 // tests.case_id points here and a run that happened stays true.
 export async function DELETE(_request: Request, context: Context): Promise<Response> {
   return handle(async () => {
-    const user = await requireUser();
+    const user = await requireRole("lead");
     deleteCase(getDb(), routeId((await context.params).id), user.userId);
     return Response.json({ ok: true });
   });

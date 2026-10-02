@@ -21,7 +21,7 @@ import { BadRequestError, handle, requireRole, routeId } from "../../helpers";
 */
 export async function POST(request: Request): Promise<Response> {
   return handle(async () => {
-    await requireRole("admin", "lead");
+    await requireRole("admin");
 
     const contentType = request.headers.get("content-type") ?? "";
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) {

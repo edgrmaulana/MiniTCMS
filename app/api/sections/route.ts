@@ -5,13 +5,13 @@ import {
   optionalInteger,
   optionalText,
   readBody,
+  requireRole,
   requireText,
-  requireUser,
 } from "../helpers";
 
 export async function POST(request: Request): Promise<Response> {
   return handle(async () => {
-    await requireUser();
+    await requireRole("lead");
     const body = await readBody(request, ["suiteId", "parentId", "name", "description"]);
     if (!Number.isInteger(body.suiteId)) throw new BadRequestError("suiteId is required");
     const id = createSection(getDb(), {

@@ -4,8 +4,8 @@ import {
   optionalInteger,
   optionalText,
   readBody,
+  requireRole,
   requireText,
-  requireUser,
   routeId,
 } from "../../helpers";
 
@@ -21,7 +21,7 @@ export async function PATCH(
   context: { params: Promise<{ id: string }> },
 ): Promise<Response> {
   return handle(async () => {
-    await requireUser();
+    await requireRole("lead");
     const id = routeId((await context.params).id);
     const body = await readBody(request, ["name", "description", "parentId", "displayOrder"]);
     editSection(getDb(), id, {

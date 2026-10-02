@@ -50,15 +50,15 @@ export async function GET(request: Request, context: Context): Promise<Response>
 // answer as the UI.
 export async function PATCH(request: Request, context: Context): Promise<Response> {
   return handle(async () => {
+    // Renaming, closing and reopening are all lead work, checked before the
+    // body is read. A tester records results inside a run; they do not decide
+    // when it is finished.
+    await requireRole("lead");
     const id = routeId((await context.params).id);
     const body = await readBody(request, ["name", "description", "config", "isCompleted"]);
     if (body.isCompleted !== undefined && typeof body.isCompleted !== "boolean") {
       throw new BadRequestError("isCompleted must be true or false");
     }
-    // Reopening is the privileged half: closing a run you have been working
-    // is ordinary, unlocking somebody's finished run is not.
-    if (body.isCompleted === false) await requireRole("admin", "lead");
-    else await requireUser();
 
     const database = getDb();
     // One PATCH, one transaction: a rejected rename must not leave the run

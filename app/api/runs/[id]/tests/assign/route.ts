@@ -4,7 +4,7 @@ import {
   optionalInteger,
   readBody,
   requireIdList,
-  requireUser,
+  requireRole,
   routeId,
 } from "../../../../helpers";
 
@@ -15,7 +15,7 @@ export async function POST(
   context: { params: Promise<{ id: string }> },
 ): Promise<Response> {
   return handle(async () => {
-    await requireUser();
+    await requireRole("lead");
     const runId = routeId((await context.params).id);
     const body = await readBody(request, ["testIds", "assignedTo"]);
     const changed = assignTests(

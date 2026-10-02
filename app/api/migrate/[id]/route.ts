@@ -6,7 +6,7 @@ type Params = { params: Promise<{ id: string }> };
 
 export async function GET(request: Request, { params }: Params): Promise<Response> {
   return handle(async () => {
-    await requireRole("admin", "lead");
+    await requireRole("admin");
     const id = routeId((await params).id);
     const run = getImportRun(getDb(), id);
     if (!run) throw new NotFoundError(`No import run with id ${id}`);

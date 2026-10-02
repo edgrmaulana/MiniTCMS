@@ -13,7 +13,7 @@ import { handle, requireRole } from "../helpers";
 */
 export async function GET(request: Request): Promise<Response> {
   return handle(async () => {
-    await requireRole("admin", "lead");
+    await requireRole("admin");
     const url = new URL(request.url);
     return Response.json(
       listImportRuns(getDb(), {
