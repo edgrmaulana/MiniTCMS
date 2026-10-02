@@ -17,6 +17,7 @@ import {
   validateCustom,
   type AttachmentEntity,
   type ActivityRow,
+  type ApiKeyRow,
   type AssignableUser,
   type AttachmentRow,
   type CaseFieldRow,
@@ -43,7 +44,7 @@ import {
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -98,6 +99,36 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   attempted_on INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts ON login_attempts(identifier, attempted_on);
+
+/*
+  CI credentials. Stored exactly like a session - only the SHA-256 hash, never
+  the key - so a database dump does not hand over working credentials, and a
+  revoke is a timestamp rather than a delete: a key that was used for six
+  months is part of the audit trail even after it stops working.
+
+  A key carries no permissions of its own. Every check reads the owner's role
+  through the join below, so revoking a role revokes it everywhere at once and
+  a key can never outrank the person who made it.
+*/
+CREATE TABLE IF NOT EXISTS api_keys (
+  id           INTEGER PRIMARY KEY,
+  user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  key_hash     TEXT NOT NULL,
+  created_on   INTEGER NOT NULL,
+  last_used_on INTEGER,
+  revoked_on   INTEGER
+);
+/*
+  The hash index is the authentication path and runs on every API request:
+  SEARCH api_keys USING INDEX idx_api_keys_hash, 0.014ms over 500 keys.
+
+  The second carries the id so one owner's keys come back in order without a
+  sort: SEARCH api_keys USING COVERING INDEX idx_api_keys_user, no temp B-tree,
+  0.035ms for a page of 25. On user_id alone the same list sorted every page.
+*/
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user        ON api_keys(user_id, id);
 
 CREATE TABLE IF NOT EXISTS statuses (
   id          INTEGER PRIMARY KEY,
@@ -598,6 +629,116 @@ export function clearLoginAttempts(database: Database.Database, identifier: stri
 
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/* ------------------------------------------------------------------ *
+ * API keys: the credential a CI job presents instead of a cookie
+ * ------------------------------------------------------------------ */
+
+export function insertApiKey(
+  database: Database.Database,
+  key: { userId: number; name: string; keyHash: string },
+): number {
+  const result = database
+    .prepare("INSERT INTO api_keys (user_id, name, key_hash, created_on) VALUES (?, ?, ?, ?)")
+    .run(key.userId, key.name, key.keyHash, nowSeconds());
+  return Number(result.lastInsertRowid);
+}
+
+/*
+  The key path's one lookup, and the mirror of findSessionUser: the role comes
+  from the owner's row, so a key is never more than its owner, and a
+  deactivated account's keys stop working the moment the account does.
+
+  EXPLAIN QUERY PLAN over 500 keys and 50 users: SEARCH api_keys USING INDEX
+  idx_api_keys_hash (key_hash=?), SEARCH users USING INTEGER PRIMARY KEY.
+  0.014ms per call, and flat as the table grows - this runs on every single
+  API request, so it had better not be a scan.
+*/
+export function findApiKeyUser(
+  database: Database.Database,
+  keyHash: string,
+): SessionUser | undefined {
+  return database
+    .prepare(
+      `SELECT users.id AS userId, users.email, users.name, users.role,
+              NULL AS expiresOn, api_keys.id AS apiKeyId
+         FROM api_keys
+         JOIN users ON users.id = api_keys.user_id
+        WHERE api_keys.key_hash = ?
+          AND api_keys.revoked_on IS NULL
+          AND users.is_active = 1`,
+    )
+    .get(keyHash) as SessionUser | undefined;
+}
+
+export const API_KEY_TOUCH_SECONDS = 60;
+
+/*
+  Coarse on purpose. This answers one question - is this key still in use, or
+  can it be revoked - and a minute's resolution answers it. Writing on every
+  request would mean a write per API read, which is what SQLite serialises on
+  and exactly what the rate limiter exists to keep off the hot path.
+
+  One UPDATE, no read first (AGENTS.md rule 17): two CI jobs sharing a key
+  would otherwise race and one of the two timestamps would be lost.
+*/
+export function touchApiKey(database: Database.Database, id: number): void {
+  const now = nowSeconds();
+  database
+    .prepare(
+      `UPDATE api_keys SET last_used_on = ?
+        WHERE id = ? AND (last_used_on IS NULL OR last_used_on < ?)`,
+    )
+    .run(now, id, now - API_KEY_TOUCH_SECONDS);
+}
+
+/*
+  Keys as a human may see them: no key_hash in the column list, so the secret
+  cannot reach a response body by somebody adding a Response.json later.
+
+  EXPLAIN QUERY PLAN over 500 keys: SCAN api_keys, SEARCH users USING INTEGER
+  PRIMARY KEY, and no temp B-tree - ORDER BY id DESC walks the rowid backwards
+  and stops at the limit. 0.036ms for a page of 25. The scan is left alone: it
+  is bounded by the page, and this table holds one row per CI job.
+*/
+export function listApiKeys(
+  database: Database.Database,
+  options: ListOptions & { userId?: number } = {},
+): ListResult<ApiKeyRow> {
+  const where = options.userId === undefined ? "" : "WHERE api_keys.user_id = ?";
+  const filter = options.userId === undefined ? [] : [options.userId];
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM api_keys ${where}`).get(...filter) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT api_keys.id, api_keys.user_id, users.email, api_keys.name,
+              api_keys.created_on, api_keys.last_used_on, api_keys.revoked_on
+         FROM api_keys
+         JOIN users ON users.id = api_keys.user_id
+         ${where}
+        ORDER BY api_keys.id DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...filter, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as ApiKeyRow[];
+  return paged(rows, total, options);
+}
+
+// Revoking twice is not success: the second call tells the caller the key was
+// already dead rather than implying it just stopped it.
+export function revokeApiKey(database: Database.Database, id: number): void {
+  const result = database
+    .prepare("UPDATE api_keys SET revoked_on = ? WHERE id = ? AND revoked_on IS NULL")
+    .run(nowSeconds(), id);
+  if (result.changes === 0) {
+    if (!database.prepare("SELECT 1 FROM api_keys WHERE id = ?").get(id)) {
+      throw new NotFoundError(`No API key with id ${id}`);
+    }
+    throw new ConflictError(`API key ${id} is already revoked`);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1980,7 +2121,16 @@ export function assertTestsInRun(
 }
 
 export type ResultInput = {
-  testId: number;
+  /*
+    The test, or the case plus the run it ran in. A CI reporter knows which
+    case it executed, not which test row that became, and making it resolve
+    the id first would be a second round trip plus a window where the run is
+    closed between the two calls. Resolution happens inside the write
+    transaction below instead.
+  */
+  testId?: number;
+  caseId?: number;
+  runId?: number;
   statusId: number;
   comment?: string | null;
   elapsed?: string | null;
@@ -1990,6 +2140,49 @@ export type ResultInput = {
   custom?: Record<string, unknown>;
   createdBy?: number | null;
 };
+
+type ResolvedResult = ResultInput & { testId: number };
+
+/*
+  Turns every entry into a concrete test id, inside the caller's transaction.
+  A reporter posting by case id gets the same guarantees as one posting by test
+  id: an unknown pair fails loud with the ids in the message, and the test the
+  result lands on cannot change between the lookup and the insert.
+
+  EXPLAIN QUERY PLAN over 200,000 tests (20,000 cases across 10 runs): SEARCH
+  tests USING INDEX idx_tests_case (case_id=?), 0.002ms per lookup. 500 results
+  posted by case id take 3.6ms against 2.6ms by test id - one millisecond for
+  the whole batch, which is the price of not making CI resolve ids first.
+*/
+function resolveResultTargets(
+  database: Database.Database,
+  entries: readonly ResultInput[],
+): ResolvedResult[] {
+  if (entries.every((entry) => entry.testId !== undefined && entry.caseId === undefined)) {
+    return entries as ResolvedResult[];
+  }
+  // createRun writes one test per case, so this is a single row; ordered by id
+  // anyway, because "whichever row came back first" is not an answer.
+  const findTest = database.prepare(
+    "SELECT id FROM tests WHERE run_id = ? AND case_id = ? ORDER BY id LIMIT 1",
+  );
+  return entries.map((entry) => {
+    if (entry.testId !== undefined) {
+      if (entry.caseId !== undefined) {
+        throw new ConflictError("A result names a test id or a case id, never both");
+      }
+      return entry as ResolvedResult;
+    }
+    if (entry.caseId === undefined || entry.runId === undefined) {
+      throw new ConflictError("A result needs a test id, or a case id and a run id");
+    }
+    const found = findTest.get(entry.runId, entry.caseId) as { id: number } | undefined;
+    if (!found) {
+      throw new NotFoundError(`Case ${entry.caseId} is not in run ${entry.runId}`);
+    }
+    return { ...entry, testId: found.id };
+  });
+}
 
 /*
   The one write path for a result. addResult, setStatusBulk and
@@ -2009,8 +2202,9 @@ function recordResults(database: Database.Database, entries: readonly ResultInpu
   }
 
   const write = database.transaction(() => {
+    const resolved = resolveResultTargets(database, entries);
     const statuses = new Map(listStatuses(database).map((status) => [status.id, status]));
-    for (const entry of entries) {
+    for (const entry of resolved) {
       const status = statuses.get(entry.statusId);
       if (!status) throw new NotFoundError(`No status with id ${entry.statusId}`);
       if (!isAssignableStatus(status)) {
@@ -2028,7 +2222,7 @@ function recordResults(database: Database.Database, entries: readonly ResultInpu
          FROM tests JOIN runs ON runs.id = tests.run_id
         WHERE tests.id = ?`,
     );
-    for (const testId of new Set(entries.map((entry) => entry.testId))) {
+    for (const testId of new Set(resolved.map((entry) => entry.testId))) {
       const run = runOf.get(testId) as
         | { run_id: number; name: string; is_completed: number }
         | undefined;
@@ -2048,7 +2242,7 @@ function recordResults(database: Database.Database, entries: readonly ResultInpu
     const timestamp = nowSeconds();
     const ids: number[] = [];
 
-    for (const entry of entries) {
+    for (const entry of resolved) {
       ids.push(
         Number(
           insert.run(

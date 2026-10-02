@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import {
+  API_KEY_TOUCH_SECONDS,
+  ConflictError,
   clearLoginAttempts,
   countLoginAttempts,
   countUsers,
@@ -11,9 +13,15 @@ import {
   deleteExpiredLoginAttempts,
   deleteExpiredSessions,
   deleteSession,
+  findApiKeyUser,
   findSessionUser,
   findUserByEmail,
+  insertApiKey,
+  NotFoundError,
   insertSession,
+  listApiKeys,
+  revokeApiKey,
+  touchApiKey,
   nowSeconds,
   openDb,
   SCHEMA_VERSION,
@@ -471,6 +479,105 @@ describe("login attempts", () => {
       .run("email:a@example.com", nowSeconds());
     clearLoginAttempts(database, "email:a@example.com");
     expect(countLoginAttempts(database, "email:a@example.com", 900)).toBe(0);
+  });
+});
+
+describe("api keys", () => {
+  function seedKey(userId: number, name = "ci", keyHash = "hash-key-a") {
+    return insertApiKey(database, { userId, name, keyHash });
+  }
+
+  it("resolves a key to its owner, with the owner's role", () => {
+    const userId = createUser(database, {
+      email: "lead@example.com",
+      role: "lead",
+      passwordHash: null,
+    });
+    seedKey(userId);
+    const found = findApiKeyUser(database, "hash-key-a");
+    expect(found?.userId).toBe(userId);
+    expect(found?.role).toBe("lead");
+    // No expiry, and the key id so the request can be rate limited and stamped.
+    expect(found?.expiresOn).toBeNull();
+    expect(found?.apiKeyId).toBeGreaterThan(0);
+  });
+
+  it("refuses an unknown hash", () => {
+    seedKey(seedUser());
+    expect(findApiKeyUser(database, "hash-nobody")).toBeUndefined();
+  });
+
+  it("refuses a revoked key and says so on a second revoke", () => {
+    const keyId = seedKey(seedUser());
+    revokeApiKey(database, keyId);
+    expect(findApiKeyUser(database, "hash-key-a")).toBeUndefined();
+    expect(() => revokeApiKey(database, keyId)).toThrow(ConflictError);
+    expect(() => revokeApiKey(database, keyId + 99)).toThrow(NotFoundError);
+  });
+
+  it("refuses a key whose owner was deactivated", () => {
+    const userId = seedUser();
+    seedKey(userId);
+    database.prepare("UPDATE users SET is_active = 0 WHERE id = ?").run(userId);
+    expect(findApiKeyUser(database, "hash-key-a")).toBeUndefined();
+  });
+
+  it("goes with the user when the user goes", () => {
+    const userId = seedUser();
+    seedKey(userId);
+    database.prepare("DELETE FROM users WHERE id = ?").run(userId);
+    const left = database.prepare("SELECT COUNT(*) AS total FROM api_keys").get() as {
+      total: number;
+    };
+    expect(left.total).toBe(0);
+  });
+
+  it("stamps last use, then leaves it alone inside the window", () => {
+    const keyId = seedKey(seedUser());
+    touchApiKey(database, keyId);
+    const first = database
+      .prepare("SELECT last_used_on FROM api_keys WHERE id = ?")
+      .get(keyId) as { last_used_on: number };
+    expect(first.last_used_on).toBeGreaterThan(0);
+
+    // Pretend the stamp is one second old: inside the window, so a second
+    // request must not write again.
+    database
+      .prepare("UPDATE api_keys SET last_used_on = ? WHERE id = ?")
+      .run(nowSeconds() - 1, keyId);
+    touchApiKey(database, keyId);
+    const second = database
+      .prepare("SELECT last_used_on FROM api_keys WHERE id = ?")
+      .get(keyId) as { last_used_on: number };
+    expect(second.last_used_on).toBe(nowSeconds() - 1);
+
+    database
+      .prepare("UPDATE api_keys SET last_used_on = ? WHERE id = ?")
+      .run(nowSeconds() - API_KEY_TOUCH_SECONDS - 1, keyId);
+    touchApiKey(database, keyId);
+    const third = database
+      .prepare("SELECT last_used_on FROM api_keys WHERE id = ?")
+      .get(keyId) as { last_used_on: number };
+    expect(third.last_used_on).toBe(nowSeconds());
+  });
+
+  it("lists keys without their hash, newest first, filtered by owner", () => {
+    const first = seedUser("one@example.com");
+    const second = seedUser("two@example.com");
+    seedKey(first, "one ci", "hash-1");
+    const newest = seedKey(second, "two ci", "hash-2");
+
+    const all = listApiKeys(database, {});
+    expect(all.total).toBe(2);
+    expect(all.rows[0].id).toBe(newest);
+    expect(all.rows[0].email).toBe("two@example.com");
+    for (const row of all.rows) {
+      expect(Object.keys(row)).not.toContain("key_hash");
+    }
+
+    const mine = listApiKeys(database, { userId: first });
+    expect(mine.total).toBe(1);
+    expect(mine.rows[0].name).toBe("one ci");
   });
 });
 

@@ -10,6 +10,19 @@ export function isUserRole(value: string): value is UserRole {
 }
 
 /*
+  The three roles are a ladder, not a set of overlapping permissions: admin can
+  do everything lead can, lead everything tester can. Ranked here so a route
+  states the floor it needs ("lead or better") instead of listing the roles
+  that clear it - a list is the thing somebody forgets to extend when a fourth
+  role lands, and forgetting it fails open.
+*/
+const ROLE_RANK: Record<UserRole, number> = { tester: 1, lead: 2, admin: 3 };
+
+export function roleAtLeast(role: UserRole, minimum: UserRole): boolean {
+  return ROLE_RANK[role] >= ROLE_RANK[minimum];
+}
+
+/*
   TestRail's five built-in result statuses, with TestRail's own ids. Pinned
   deliberately so the phase 4 import maps 1:1 and never has to translate the
   common case. Custom statuses start at 6, the same place TestRail starts them.
@@ -204,12 +217,33 @@ export type AssignableUser = {
   role: UserRole;
 };
 
+/*
+  Who the request is, however it proved it. A cookie session and an API key
+  land in the same shape on purpose: a route asks "which user, which role" and
+  never has to branch on how they signed in, so a key can never reach a path a
+  session cannot.
+*/
 export type SessionUser = {
   userId: number;
   email: string;
   name: string | null;
   role: UserRole;
-  expiresOn: number;
+  // Null for an API key: it lives until somebody revokes it.
+  expiresOn: number | null;
+  // Set only on the key path, so rate limiting and last-used can find the row.
+  apiKeyId?: number;
+};
+
+// An API key as it may be shown. The hash is not in here, and nothing joins
+// it in later: the secret is printed once, at creation, and never again.
+export type ApiKeyRow = {
+  id: number;
+  user_id: number;
+  email: string;
+  name: string;
+  created_on: number;
+  last_used_on: number | null;
+  revoked_on: number | null;
 };
 
 // Rows carry snake_case straight from SQLite; nothing renames on the way out.
