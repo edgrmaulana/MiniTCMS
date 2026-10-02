@@ -26,6 +26,21 @@ export type ResultStatusId = (typeof RESULT_STATUS)[keyof typeof RESULT_STATUS];
 
 export const FIRST_CUSTOM_STATUS_ID = 6;
 
+/*
+  Failing or blocking without saying why leaves somebody reproducing it from
+  scratch tomorrow. The rule lives here because two places need it: lib/db.ts
+  enforces it on every write, including the CI reporter's, and the run screen
+  reads it to open the comment box instead of writing straight through.
+*/
+export const COMMENT_REQUIRED_STATUS_IDS: readonly number[] = [
+  RESULT_STATUS.failed,
+  RESULT_STATUS.blocked,
+];
+
+export function needsComment(statusId: number): boolean {
+  return COMMENT_REQUIRED_STATUS_IDS.includes(statusId);
+}
+
 export const BUILT_IN_STATUSES = [
   { id: RESULT_STATUS.passed, systemName: "passed", label: "Passed", color: "#2fe0a8", isUntested: 0, isFinal: 1 },
   { id: RESULT_STATUS.blocked, systemName: "blocked", label: "Blocked", color: "#8793ab", isUntested: 0, isFinal: 1 },
@@ -55,6 +70,27 @@ export const CASE_TYPE = {
   security: 5,
   other: 6,
 } as const;
+
+/*
+  Display labels, derived from the id maps above rather than written out a
+  second time: a type added to CASE_TYPE cannot leave a table rendering a bare
+  number. An id with no name here - a custom TestRail priority the import
+  mapped past 4 - renders as its id rather than as nothing.
+*/
+function labelsFor(ids: Record<string, number>): Record<number, string> {
+  return Object.fromEntries(
+    Object.entries(ids).map(([name, id]) => [id, name[0].toUpperCase() + name.slice(1)]),
+  );
+}
+
+export const CASE_PRIORITY_LABELS = labelsFor(CASE_PRIORITY);
+
+export const CASE_TYPE_LABELS = labelsFor(CASE_TYPE);
+
+export function labelFor(labels: Record<number, string>, id: number | null): string {
+  if (id === null) return "-";
+  return labels[id] ?? `#${id}`;
+}
 
 // TestRail's documented suite_mode values; these are fixed, not configurable.
 export const SUITE_MODE = {
@@ -157,6 +193,17 @@ export type UserRow = {
   created_on: number;
 };
 
+/*
+  A user as every screen is allowed to see one: no password hash, no session.
+  Rows come from listUsers in lib/db.ts.
+*/
+export type AssignableUser = {
+  id: number;
+  email: string;
+  name: string | null;
+  role: UserRole;
+};
+
 export type SessionUser = {
   userId: number;
   email: string;
@@ -198,6 +245,21 @@ export type SectionRow = {
   description: string | null;
   source: string | null;
   source_id: number | null;
+};
+
+/*
+  One row of sectionTree() in lib/db.ts. Declared here rather than there
+  because the tree is rendered by a client component, and nothing in app/ may
+  import the database module.
+*/
+export type SectionTreeRow = {
+  id: number;
+  parent_id: number | null;
+  depth: number;
+  display_order: number;
+  name: string;
+  description: string | null;
+  case_count: number;
 };
 
 export type CaseRow = {
@@ -466,6 +528,45 @@ export function formatElapsed(seconds: number | null): string | null {
     .join(" ");
 }
 
+/*
+  One timestamp format for every screen, in UTC. Not the viewer's locale on
+  purpose: the server renders the same string the client does, so a run's
+  history does not flicker on hydration, and two testers in two timezones
+  reading the same result see the same time.
+*/
+export function formatTimestamp(seconds: number | null | undefined): string {
+  if (!seconds) return "-";
+  return `${new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ")}Z`;
+}
+
+/*
+  What the dashboard shows for one project, all of it counted in SQL by
+  projectOverview in lib/db.ts. `progress` is the same shape a run carries, so
+  the pass rate on the dashboard and the pass rate on a run are one function.
+*/
+export type ProjectOverview = {
+  openRuns: number;
+  totalRuns: number;
+  progress: RunProgress;
+};
+
+/*
+  One recorded result, with enough of its test and run to be readable on the
+  dashboard. This is the activity feed: results are the only history there is,
+  so recent activity is recent results and nothing else.
+*/
+export type ActivityRow = {
+  id: number;
+  status_id: number;
+  created_on: number;
+  comment: string | null;
+  test_id: number;
+  run_id: number;
+  run_name: string;
+  title_snapshot: string;
+  author: string | null;
+};
+
 export type MilestoneRow = {
   id: number;
   project_id: number;
@@ -503,6 +604,16 @@ export type AttachmentRow = {
   source: string | null;
   source_id: number | null;
 };
+
+/*
+  Which way round a CSV export writes "10/1/2026". Not derivable from the file
+  - it is a property of the exporting user's account - so it is an operator
+  input on both the CLI and the import screen, which is why the list lives here
+  rather than inside the CSV reader. lib/migrate/map.ts owns the validator.
+*/
+export const DATE_ORDERS = ["mdy", "dmy"] as const;
+
+export type DateOrder = (typeof DATE_ORDERS)[number];
 
 export const IMPORT_STATES = ["pending", "running", "failed", "done"] as const;
 

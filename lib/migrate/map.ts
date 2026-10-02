@@ -14,10 +14,12 @@ import {
   CASE_PRIORITY,
   CASE_TEMPLATE,
   CASE_TYPE,
+  DATE_ORDERS,
   MAX_SECTION_LEVELS,
   RESULT_STATUS,
   SUITE_MODE,
   type CaseFieldType,
+  type DateOrder,
 } from "../format.ts";
 import type { ImportRow } from "../db.ts";
 
@@ -147,9 +149,10 @@ export function slugifyFieldName(label: string): string {
   return /^[0-9]/.test(slug) ? `f_${slug}` : slug;
 }
 
-export const DATE_ORDERS = ["mdy", "dmy"] as const;
-
-export type DateOrder = (typeof DATE_ORDERS)[number];
+// Declared in lib/format.ts, because the import screen offers the same two
+// choices; re-exported here so the CSV reader stays the one import for callers.
+export { DATE_ORDERS };
+export type { DateOrder };
 
 export function isDateOrder(value: string): value is DateOrder {
   return (DATE_ORDERS as readonly string[]).includes(value);

@@ -154,3 +154,196 @@ body {
     transition: none;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Console shell and the dense lists. Same tokens as the login page; no second
+   palette. Sizes are picked for a 50-row table read all day: 13px body in the
+   grid, 11px for the labels around it.
+   --------------------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 15rem minmax(0, 1fr);
+  min-height: 100dvh;
+  background:
+    radial-gradient(80% 50% at 0% 0%, rgba(107, 111, 240, 0.10), transparent 60%),
+    radial-gradient(70% 45% at 100% 100%, rgba(47, 224, 168, 0.07), transparent 60%),
+    var(--night);
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  padding: 1.25rem 1rem;
+  border-right: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--panel) 0%, var(--night-deep) 100%);
+}
+
+.rail-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.4rem;
+  border-left: 2px solid transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.rail-link:hover {
+  color: var(--ink);
+  background: rgba(107, 111, 240, 0.10);
+}
+
+.rail-link[aria-current="page"] {
+  color: var(--ink);
+  border-left-color: var(--aurora);
+  background: rgba(47, 224, 168, 0.08);
+}
+
+.label {
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.sheet {
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: linear-gradient(180deg, rgba(8, 12, 22, 0.9) 0%, rgba(5, 8, 15, 0.9) 100%);
+}
+
+/* A compact field for the toolbars, where .field's 12px padding is too tall. */
+.field-sm {
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: rgba(3, 6, 13, 0.72);
+  color: var(--ink);
+  font-size: 0.8rem;
+}
+
+.field-sm:focus-visible {
+  outline: none;
+  border-color: var(--aurora);
+  box-shadow: 0 0 0 3px rgba(47, 224, 168, 0.16);
+}
+
+.chip {
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: rgba(3, 6, 13, 0.6);
+  color: var(--ink);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.chip:hover:not(:disabled) {
+  border-color: var(--violet);
+}
+
+.chip:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pill {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  border: 1px solid currentColor;
+}
+
+.grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.grid-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0.5rem 0.7rem;
+  text-align: left;
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--night-deep);
+  border-bottom: 1px solid var(--line);
+}
+
+.grid-table tbody td {
+  padding: 0.4rem 0.7rem;
+  border-bottom: 1px solid rgba(27, 35, 53, 0.6);
+}
+
+.grid-table tbody tr:hover td {
+  background: rgba(107, 111, 240, 0.07);
+}
+
+.grid-table tbody tr[data-selected="true"] td {
+  background: rgba(47, 224, 168, 0.09);
+}
+
+.tree-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 0.3rem;
+  text-align: left;
+  font-size: 0.78rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.tree-row:hover {
+  color: var(--ink);
+  background: rgba(107, 111, 240, 0.08);
+}
+
+.tree-row[aria-pressed="true"] {
+  color: var(--ink);
+  background: rgba(47, 224, 168, 0.10);
+}
+
+/* One entrance for the console, same curve as the login panel. */
+.rise {
+  animation: rise 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise {
+    animation: none;
+  }
+}
+
+/* The keyboard cursor on the run screen. A row the eye can find without
+   hunting, and distinct from selection, which is a different fact. */
+.grid-table tbody tr[data-cursor="true"] td:first-child {
+  box-shadow: inset 2px 0 0 var(--aurora);
+}
+
+.grid-table tbody tr[data-cursor="true"] td {
+  background: rgba(107, 111, 240, 0.12);
+}
+
+textarea.field-sm {
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.4;
+}

@@ -1,8 +1,9 @@
-import { createRun, getDb, listRuns } from "@/lib/db";
+import { createRun, getDb, listRunsWithProgress } from "@/lib/db";
 import {
   BadRequestError,
   handle,
   listOptionsFrom,
+  optionalFlag,
   optionalInteger,
   optionalQueryId,
   optionalText,
@@ -18,10 +19,13 @@ export async function GET(request: Request): Promise<Response> {
     await requireUser();
     const url = new URL(request.url);
     return Response.json(
-      listRuns(getDb(), {
+      // With progress: the list screen draws a bar per run, and one summary
+      // request per row would be 25 round trips for one screen.
+      listRunsWithProgress(getDb(), {
         ...listOptionsFrom(url),
         projectId: queryId(url, "projectId"),
         planId: optionalQueryId(url, "planId"),
+        isCompleted: optionalFlag(url, "isCompleted"),
       }),
     );
   });

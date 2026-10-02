@@ -29,6 +29,10 @@ import {
   MAX_BULK_IDS,
   listCaseFields,
   listCases,
+  listRunsWithProgress,
+  projectOverview,
+  recentActivity,
+  listUsers,
   listProjects,
   moveSection,
   sectionTree,
@@ -1183,5 +1187,215 @@ describe("elapsed time", () => {
     expect(formatElapsed(parseElapsed("1m 45s"))).toBe("1m 45s");
     expect(formatElapsed(parseElapsed("2h 3m 4s"))).toBe("2h 3m 4s");
     expect(formatElapsed(0)).toBeNull();
+  });
+});
+
+describe("listUsers", () => {
+  it("lists active accounts only, and never the password hash", () => {
+    const activeId = seedUser("active@example.com");
+    const disabledId = seedUser("disabled@example.com");
+    database.prepare("UPDATE users SET is_active = 0 WHERE id = ?").run(disabledId);
+
+    const page = listUsers(database);
+    expect(page.rows.map((user) => user.id)).toEqual([activeId]);
+    expect(Object.keys(page.rows[0])).toEqual(["id", "email", "name", "role"]);
+  });
+
+  it("searches email and name, and treats a wildcard as a character", () => {
+    createUser(database, {
+      email: "ada@example.com",
+      name: "Ada Lovelace",
+      role: "lead",
+      passwordHash: null,
+    });
+    seedUser("grace@example.com");
+
+    expect(listUsers(database, { search: "lovelace" }).rows.map((user) => user.email)).toEqual([
+      "ada@example.com",
+    ]);
+    expect(listUsers(database, { search: "grace@" }).total).toBe(1);
+    // Unescaped, this pattern would match every row in the table.
+    expect(listUsers(database, { search: "%" }).total).toBe(0);
+  });
+
+  it("pages in SQL", () => {
+    for (let index = 0; index < 30; index += 1) {
+      seedUser(`tester${String(index).padStart(2, "0")}@example.com`);
+    }
+    const first = listUsers(database, { limit: 25 });
+    expect(first.total).toBe(30);
+    expect(first.rows).toHaveLength(25);
+    expect(listUsers(database, { limit: 25, page: 2 }).rows).toHaveLength(5);
+  });
+});
+
+describe("listRunsWithProgress", () => {
+  function seedTwoRuns() {
+    const projectId = createProject(database, { name: "Payments" });
+    const suiteId = createSuite(database, { projectId, name: "API" });
+    const sectionId = createSection(database, { suiteId, name: "health" });
+    for (let index = 0; index < 2; index += 1) {
+      createCase(database, { suiteId, sectionId, title: `Case ${index}` });
+    }
+    const closedRunId = createRun(database, {
+      projectId,
+      suiteId,
+      name: "Last week",
+      includeAll: true,
+    });
+    const openRunId = createRun(database, {
+      projectId,
+      suiteId,
+      name: "This week",
+      includeAll: true,
+    });
+    return { projectId, closedRunId, openRunId };
+  }
+
+  it("carries one progress bar per run, open runs first", () => {
+    const { projectId, closedRunId, openRunId } = seedTwoRuns();
+    const openTestId = listTests(database, openRunId, {}).rows[0].id;
+    addResult(database, { testId: openTestId, statusId: RESULT_STATUS.passed, createdBy: null });
+    editRun(database, closedRunId, { isCompleted: true });
+
+    const page = listRunsWithProgress(database, { projectId });
+    expect(page.rows.map((run) => run.id)).toEqual([openRunId, closedRunId]);
+
+    const [open, closed] = page.rows;
+    expect(open.progress).toMatchObject({ total: 2, executed: 1, untested: 1, passRate: 1 });
+    // The second run's bar must not pick up the first run's result.
+    expect(closed.progress).toMatchObject({ total: 2, executed: 0, untested: 2, passRate: null });
+  });
+
+  it("filters open and closed runs in SQL", () => {
+    const { projectId, openRunId, closedRunId } = seedTwoRuns();
+    editRun(database, closedRunId, { isCompleted: true });
+
+    expect(
+      listRunsWithProgress(database, { projectId, isCompleted: false }).rows.map((run) => run.id),
+    ).toEqual([openRunId]);
+    const closed = listRunsWithProgress(database, { projectId, isCompleted: true });
+    expect(closed.rows.map((run) => run.id)).toEqual([closedRunId]);
+    // The total is the filtered total, not the project's: a pager reading the
+    // unfiltered count offers pages that are not there.
+    expect(closed.total).toBe(1);
+  });
+
+  it("returns no rows, and no extra query, for a project with no runs", () => {
+    const projectId = createProject(database, { name: "Empty" });
+    expect(listRunsWithProgress(database, { projectId })).toMatchObject({ rows: [], total: 0 });
+  });
+
+  it("groups a page of runs off the covering index, with no sort", () => {
+    const { closedRunId, openRunId } = seedTwoRuns();
+    const plan = database
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT run_id, status_id, COUNT(*) AS total FROM tests
+          WHERE run_id IN (?, ?) GROUP BY run_id, status_id`,
+      )
+      .all(openRunId, closedRunId) as { detail: string }[];
+    const detail = plan.map((step) => step.detail).join(" ");
+    expect(detail).toMatch(/COVERING INDEX idx_tests_run/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
+  });
+});
+
+describe("the users list plan", () => {
+  it("orders off idx_users_email rather than sorting the table", () => {
+    const plan = database
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT id, email, name, role FROM users WHERE is_active = 1 ORDER BY email LIMIT ? OFFSET ?",
+      )
+      .all(25, 0) as { detail: string }[];
+    expect(plan.map((step) => step.detail).join(" ")).not.toMatch(/TEMP B-TREE/);
+  });
+});
+
+describe("the dashboard numbers", () => {
+  function seedProjectWithResults() {
+    const projectId = createProject(database, { name: "Payments" });
+    const suiteId = createSuite(database, { projectId, name: "API" });
+    const sectionId = createSection(database, { suiteId, name: "health" });
+    for (let index = 0; index < 3; index += 1) {
+      createCase(database, { suiteId, sectionId, title: `Case ${index}` });
+    }
+    const openRunId = createRun(database, { projectId, suiteId, name: "Open", includeAll: true });
+    const closedRunId = createRun(database, { projectId, suiteId, name: "Closed", includeAll: true });
+    editRun(database, closedRunId, { isCompleted: true });
+    return { projectId, openRunId, closedRunId };
+  }
+
+  it("counts open runs and rolls every test in the project up in SQL", () => {
+    const { projectId, openRunId } = seedProjectWithResults();
+    const [firstTest, secondTest] = listTests(database, openRunId, {}).rows;
+    addResult(database, { testId: firstTest.id, statusId: RESULT_STATUS.passed, createdBy: null });
+    addResult(database, {
+      testId: secondTest.id,
+      statusId: RESULT_STATUS.failed,
+      comment: "500 on an empty body",
+      createdBy: null,
+    });
+
+    const overview = projectOverview(database, projectId);
+    expect(overview).toMatchObject({ openRuns: 1, totalRuns: 2 });
+    // Six tests across both runs; two of them executed, one passed.
+    expect(overview.progress).toMatchObject({ total: 6, executed: 2, untested: 4, passRate: 0.5 });
+  });
+
+  it("reports nothing executed rather than zero percent passing", () => {
+    const { projectId } = seedProjectWithResults();
+    expect(projectOverview(database, projectId).progress.passRate).toBeNull();
+  });
+
+  it("keeps one project's activity out of another's", () => {
+    const { projectId, openRunId } = seedProjectWithResults();
+    const other = seedProjectWithResults();
+    const authorId = seedUser("author@example.com");
+    const [ourTest] = listTests(database, openRunId, {}).rows;
+    addResult(database, {
+      testId: ourTest.id,
+      statusId: RESULT_STATUS.passed,
+      createdBy: authorId,
+    });
+
+    const ours = recentActivity(database, projectId);
+    expect(ours).toHaveLength(1);
+    expect(ours[0]).toMatchObject({
+      status_id: RESULT_STATUS.passed,
+      run_name: "Open",
+      title_snapshot: ourTest.title_snapshot,
+      author: null,
+    });
+    expect(recentActivity(database, other.projectId)).toEqual([]);
+  });
+
+  it("bounds the feed however much the caller asks for", () => {
+    const { projectId, openRunId } = seedProjectWithResults();
+    const [test] = listTests(database, openRunId, {}).rows;
+    for (let index = 0; index < 4; index += 1) {
+      addResult(database, { testId: test.id, statusId: RESULT_STATUS.passed, createdBy: null });
+    }
+    expect(recentActivity(database, projectId, 2)).toHaveLength(2);
+    expect(recentActivity(database, projectId, 10_000)).toHaveLength(4);
+    expect(recentActivity(database, projectId, 0)).toHaveLength(4);
+  });
+
+  /*
+    The feed's ORDER BY, on its own. The joined plan is stats-dependent - on an
+    empty database the planner starts from runs and sorts, with 5,000 results
+    and ANALYZE it walks idx_results_recent newest-first and stops at the limit
+    (1.9ms to 0.1ms). What must not change is that the index exists and the
+    ordering can ride it, which is what this pins.
+  */
+  it("keeps an index the activity feed's ordering can ride", () => {
+    const plan = database
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT id FROM results ORDER BY created_on DESC, id DESC LIMIT ?",
+      )
+      .all(10) as { detail: string }[];
+    const detail = plan.map((step) => step.detail).join(" ");
+    expect(detail).toMatch(/idx_results_recent/);
+    expect(detail).not.toMatch(/TEMP B-TREE/);
   });
 });

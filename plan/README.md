@@ -16,7 +16,7 @@ and *when*; AGENTS.md is the *how*.
 | 2 | `02-case-repository.md` | Projects, suites, nested sections, cases, custom fields | done |
 | 3 | `03-execution.md` | Runs, test execution, pass/fail/retest/blocked, rollups | done |
 | 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | done, bar attachments |
-| 5 | `05-ui.md` | App shell and the five screens that make it usable | next; partial |
+| 5 | `05-ui.md` | App shell and the five screens that make it usable | done |
 | 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | partial |
 | 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | not started |
 
@@ -30,7 +30,7 @@ Phase 7 is last.
 Phase 6 jumped the queue: the login page was built first, which pulled
 the `users`, `sessions` and `login_attempts` slice of the phase 1 schema
 forward with it. Phase 1 has since landed the rest, and the schema is now at
-version 9.
+version 10.
 
 ## Scope
 

@@ -7,10 +7,12 @@ Next.js 16 + SQLite. One process, one database file, one container.
 
 ## Status
 
-Early but usable over the API: sign in, import a TestRail instance or a
-case CSV, build a case tree, create a run from it and record pass, fail,
-retest or blocked against every test. The screens are not built yet, so
-today that means curl, the CLI or a CI reporter.
+Usable end to end: sign in, import a case CSV from the import screen or a
+whole TestRail instance from the CLI, browse the case tree, edit a case, then
+open a run and record pass, fail, retest or blocked against every test from
+the keyboard. The dashboard says how much of a project has been executed and
+what was recorded last. Creating projects, suites and runs is still an API
+call - those forms are the next cut.
 
 | Phase | | |
 |---|---|---|
@@ -18,7 +20,7 @@ today that means curl, the CLI or a CI reporter.
 | 2 | Case repository — projects, suites, sections, cases, custom fields | **done** |
 | 3 | Execution — runs, pass/fail/retest/blocked, append-only results | **done** |
 | 4 | TestRail migration — client, CSV reader, mapping, resumable import | **done**, bar attachments |
-| 5 | UI — app shell and the five screens | next; palette and type only |
+| 5 | UI — app shell and the five screens | **done** |
 | 6 | Auth and public API — login, roles, REST API, CI reporters | login done |
 | 7 | Release — Docker, CI, license, contributor docs | not started |
 
@@ -44,6 +46,20 @@ npm run test
 npm run lint
 npm run build
 ```
+The screens, once an account exists:
+
+| Path | What it is for |
+|---|---|
+| `/` | Dashboard — open runs, how much of the project is executed, recent results |
+| `/cases` | Section tree and the case table: search, filter, multi-select, bulk move |
+| `/cases/[id]` | One case: fields, step table, custom fields, explicit save |
+| `/runs` | Every run in the project, open ones first, each with its status bar |
+| `/runs/[id]` | The execution screen — results from the keyboard, see below |
+| `/migrate` | CSV import with a dry run, the report, and every past import |
+
+The project is chosen in the left rail and lives in the URL, so any screen
+can be pasted into a ticket and opens as the sender left it.
+
 
 ```bash
 # Import a TestRail instance over the API. Reads credentials from the
@@ -197,9 +213,35 @@ Custom statuses from a TestRail import work everywhere the built-in
 five do — the UI reads `/api/statuses` rather than assuming there are
 five.
 
+### The run screen, from the keyboard
+
+A run is executed without the mouse. The digits are TestRail's own status
+ids, which is why `3` is unbound: untested cannot be recorded.
+
+```text
+j / k, up / down   move the row cursor
+1 2 4 5            passed / blocked / retest / failed
+6 7 8 9            custom statuses, in id order, when the instance has them
+space              open the result panel on the cursor row
+enter              jump to the next untested test
+x                  toggle selection on the cursor row
+esc                clear the selection
+/                  focus the filter
+```
+
+With a selection active a status key applies to the whole selection; with
+none, to the cursor row. Failed and blocked open the panel with the comment
+focused rather than writing straight through, because the database refuses
+either without one - the selection comes with them, and a record against
+several tests carries the status and the comment only, since elapsed time,
+defects, version and assignee are facts about one test. Passed and retest
+write immediately: the row changes on the keystroke and goes back to its old
+status, with the reason, if the write is refused. On a closed run the status
+keys say so instead of trying.
+
 ## Data model
 
-Schema version 9: 17 tables, created in one block and guarded by a
+Schema version 10: 17 tables, created in one block and guarded by a
 stamp that is read before anything else is applied.
 
 ```text
