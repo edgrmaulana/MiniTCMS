@@ -9,6 +9,11 @@ import {
   offsetFor,
   PAGE_SIZES,
   RESULT_STATUS,
+  CASE_PRIORITY_LABELS,
+  CASE_TYPE_LABELS,
+  formatTimestamp,
+  labelFor,
+  needsComment,
 } from "./format";
 
 describe("result statuses", () => {
@@ -74,5 +79,37 @@ describe("page ceiling", () => {
     expect(offsetFor(2, NaN)).toBe(DEFAULT_PAGE_SIZE);
     expect(offsetFor(2, 7)).toBe(DEFAULT_PAGE_SIZE);
     expect(offsetFor(3, 50)).toBe(100);
+  });
+});
+
+describe("labels", () => {
+  it("derives a label per id from the constant, not a second table", () => {
+    expect(labelFor(CASE_PRIORITY_LABELS, 4)).toBe("Critical");
+    expect(labelFor(CASE_TYPE_LABELS, 1)).toBe("Functional");
+  });
+
+  it("shows an id it has no name for, rather than nothing", () => {
+    expect(labelFor(CASE_PRIORITY_LABELS, 99)).toBe("#99");
+    expect(labelFor(CASE_TYPE_LABELS, null)).toBe("-");
+  });
+});
+
+describe("needsComment", () => {
+  it("asks for a comment on failed and blocked only", () => {
+    expect(needsComment(RESULT_STATUS.failed)).toBe(true);
+    expect(needsComment(RESULT_STATUS.blocked)).toBe(true);
+    expect(needsComment(RESULT_STATUS.passed)).toBe(false);
+    expect(needsComment(RESULT_STATUS.retest)).toBe(false);
+  });
+});
+
+describe("formatTimestamp", () => {
+  it("renders unix seconds as UTC, the same on both sides of hydration", () => {
+    expect(formatTimestamp(1_700_000_000)).toBe("2023-11-14 22:13Z");
+  });
+
+  it("says nothing happened rather than printing the epoch", () => {
+    expect(formatTimestamp(null)).toBe("-");
+    expect(formatTimestamp(0)).toBe("-");
   });
 });

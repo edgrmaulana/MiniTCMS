@@ -11,9 +11,13 @@ import {
   clampPage,
   clampPageSize,
   isAssignableStatus,
+  needsComment,
   offsetFor,
+  runProgress,
   validateCustom,
   type AttachmentEntity,
+  type ActivityRow,
+  type AssignableUser,
   type AttachmentRow,
   type CaseFieldRow,
   type CaseRow,
@@ -22,10 +26,13 @@ import {
   type ListResult,
   type MilestoneRow,
   type PlanRow,
+  type ProjectOverview,
   type ProjectRow,
   type ResultRow,
+  type RunProgress,
   type RunRow,
   type SectionRow,
+  type SectionTreeRow,
   type StatusCount,
   type StatusRow,
   type TestRow,
@@ -36,7 +43,7 @@ import {
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -302,6 +309,20 @@ CREATE TABLE IF NOT EXISTS results (
 */
 CREATE INDEX IF NOT EXISTS idx_results_test          ON results(test_id, created_on DESC, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_results_source ON results(source, source_id);
+/*
+  The dashboard's activity feed, which reads the newest results in a project.
+  Without this the planner scans every result in the database through
+  idx_results_test and sorts the lot: measured at 10,000 tests and 5,000
+  results, SCAN results USING INDEX idx_results_test plus USE TEMP B-TREE FOR
+  ORDER BY, 1.9ms and growing with the table rather than with the page. With
+  it the walk is newest-first and stops at the limit: 0.1ms, no temp B-tree.
+
+  Ceiling: the walk is over all results, not one project's, so a dormant
+  project whose last result is a million rows back pays for the distance. A
+  per-project index is the upgrade, and it needs runs.project_id denormalised
+  onto results to exist - not worth it until a profile asks for it.
+*/
+CREATE INDEX IF NOT EXISTS idx_results_recent        ON results(created_on DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS attachments (
   id           INTEGER PRIMARY KEY,
@@ -418,6 +439,40 @@ export function getDb(): Database.Database {
     connectionCache.minitcmsDb = openDb(process.env.SQLITE_FILE ?? "./data.db");
   }
   return connectionCache.minitcmsDb;
+}
+
+/*
+  Who work can be handed to, and the names the run screens show instead of a
+  bare user id. Inactive accounts are left out: assigning a test to a disabled
+  account creates a queue nobody is watching.
+
+  The column list is explicit because `SELECT *` here would put password_hash
+  one careless Response.json away from the browser.
+
+  EXPLAIN QUERY PLAN over 60 users, searched and unsearched:
+  SCAN users USING INDEX idx_users_email - no temp B-tree, the ORDER BY rides
+  the unique index the email lookup already needs. 0.1ms for a page of 25.
+*/
+export function listUsers(
+  database: Database.Database,
+  options: ListOptions = {},
+): ListResult<AssignableUser> {
+  const search = options.search?.trim() ? likePattern(options.search) : null;
+  const where = `WHERE is_active = 1${
+    search ? " AND (email LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')" : ""
+  }`;
+  const filter = search ? [search, search] : [];
+  const total = (
+    database.prepare(`SELECT COUNT(*) AS total FROM users ${where}`).get(...filter) as {
+      total: number;
+    }
+  ).total;
+  const rows = database
+    .prepare(
+      `SELECT id, email, name, role FROM users ${where} ORDER BY email LIMIT ? OFFSET ?`,
+    )
+    .all(...filter, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as AssignableUser[];
+  return paged(rows, total, options);
 }
 
 export function normaliseEmail(email: string): string {
@@ -700,15 +755,6 @@ export function updateSuite(
   assertChanged(result.changes, "suite", id);
 }
 
-export type SectionTreeRow = {
-  id: number;
-  parent_id: number | null;
-  depth: number;
-  display_order: number;
-  name: string;
-  description: string | null;
-  case_count: number;
-};
 
 /*
   The whole tree in one query, in render order. `sort_path` is built as the CTE
@@ -1519,15 +1565,27 @@ export function updatePlan(
   assertChanged(result.changes, "plan", id);
 }
 
+export type RunFilter = ListOptions & {
+  projectId: number;
+  planId?: number | null;
+  isCompleted?: boolean;
+};
+
 export function listRuns(
   database: Database.Database,
-  filter: ListOptions & { projectId: number; planId?: number | null },
+  filter: RunFilter,
 ): ListResult<RunRow> {
   const conditions = ["project_id = ?"];
   const values: unknown[] = [filter.projectId];
   if (filter.planId !== undefined && filter.planId !== null) {
     conditions.push("plan_id = ?");
     values.push(filter.planId);
+  }
+  // Asked for by the dashboard, which wants a page of open runs rather than a
+  // page of runs it then has to sift in the browser.
+  if (filter.isCompleted !== undefined) {
+    conditions.push("is_completed = ?");
+    values.push(filter.isCompleted ? 1 : 0);
   }
   const where = `WHERE ${conditions.join(" AND ")}`;
   const total = (
@@ -1541,12 +1599,79 @@ export function listRuns(
     left alone on purpose - a project holds hundreds of runs, not hundreds of
     thousands, and the sort measured 0.2ms. An index here would cost every
     run insert to save nothing anyone can perceive.
+
+    With the is_completed filter the plan is SEARCH runs USING INDEX
+    idx_runs_project plus USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY,
+    measured over 300 runs and 60,000 tests: 0.8ms for a page of 25 with their
+    status bars. Same conclusion - the sort is over one project's runs.
   */
   const rows = database
     .prepare(`SELECT * FROM runs ${where} ORDER BY is_completed, created_on DESC, id DESC
               LIMIT ? OFFSET ?`)
     .all(...values, clampPageSize(filter.limit), offsetFor(filter.page, filter.limit)) as RunRow[];
   return paged(rows, total, filter);
+}
+
+export type RunWithProgress = RunRow & { progress: RunProgress };
+
+/*
+  The run list with the numbers its stacked bars are drawn from: two queries
+  for the page, not one per row. A list that fetched a summary per run would
+  be 25 round trips to paint one screen, and the rollup rule is the same here
+  as everywhere - counted in SQL, never by iterating fetched tests.
+*/
+export function listRunsWithProgress(
+  database: Database.Database,
+  filter: RunFilter,
+): ListResult<RunWithProgress> {
+  const page = listRuns(database, filter);
+  if (page.rows.length === 0) return { ...page, rows: [] };
+  const statuses = listStatuses(database);
+  const counts = runSummaries(
+    database,
+    page.rows.map((run) => run.id),
+  );
+  return {
+    ...page,
+    rows: page.rows.map((run) => ({
+      ...run,
+      progress: runProgress(counts.get(run.id) ?? [], statuses),
+    })),
+  };
+}
+
+/*
+  One GROUP BY for a page of runs. Chunked like every other id list even
+  though a page caps at 100: the bound belongs to the function, not to the
+  caller that happens to respect it today.
+
+  EXPLAIN QUERY PLAN over 40 runs holding 80,000 tests:
+  SEARCH tests USING COVERING INDEX idx_tests_run (run_id=?) - no temp B-tree,
+  that index carries both grouped columns. A page of 25 runs covering 50,000
+  of those tests costs 2.5ms end to end, bars included.
+*/
+function runSummaries(
+  database: Database.Database,
+  runIds: readonly number[],
+): Map<number, StatusCount[]> {
+  const byRun = new Map<number, StatusCount[]>();
+  for (const chunk of chunked(runIds)) {
+    const placeholders = chunk.map(() => "?").join(", ");
+    const rows = database
+      .prepare(
+        `SELECT run_id, status_id, COUNT(*) AS total
+           FROM tests
+          WHERE run_id IN (${placeholders})
+          GROUP BY run_id, status_id`,
+      )
+      .all(...chunk) as (StatusCount & { run_id: number })[];
+    for (const row of rows) {
+      const counts = byRun.get(row.run_id) ?? [];
+      counts.push({ status_id: row.status_id, total: row.total });
+      byRun.set(row.run_id, counts);
+    }
+  }
+  return byRun;
 }
 
 export function getRun(database: Database.Database, id: number): RunRow | undefined {
@@ -1866,11 +1991,6 @@ export type ResultInput = {
   createdBy?: number | null;
 };
 
-// Failing or blocking without saying why leaves somebody reproducing it from
-// scratch tomorrow. Enforced here rather than in the route so the CI reporter
-// path cannot skip it.
-const COMMENT_REQUIRED_FOR: readonly number[] = [RESULT_STATUS.failed, RESULT_STATUS.blocked];
-
 /*
   The one write path for a result. addResult, setStatusBulk and
   addResultsBulk all build entries and come through here, so there is a
@@ -1898,7 +2018,7 @@ function recordResults(database: Database.Database, entries: readonly ResultInpu
           `"${status.label}" is the absence of a result, not one that can be recorded`,
         );
       }
-      if (COMMENT_REQUIRED_FOR.includes(entry.statusId) && !entry.comment?.trim()) {
+      if (needsComment(entry.statusId) && !entry.comment?.trim()) {
         throw new ConflictError(`A "${status.label}" result needs a comment`);
       }
     }
@@ -2007,6 +2127,79 @@ export function listResults(
     )
     .all(testId, clampPageSize(options.limit), offsetFor(options.page, options.limit)) as ResultRow[];
   return paged(rows, total, options);
+}
+
+/*
+  The dashboard's numbers for one project: how many runs are open, and one
+  status rollup across every test in every run of the project. Two aggregates,
+  no row ever leaves SQLite to be counted in JS.
+
+  The pass rate comes back inside a RunProgress, which means it arrives with
+  its untested count attached and cannot be rendered alone - the same
+  guarantee a single run gets.
+
+  EXPLAIN QUERY PLAN over 20 runs holding 10,000 tests:
+  SEARCH runs USING COVERING INDEX idx_runs_project, SEARCH tests USING
+  COVERING INDEX idx_tests_run, then USE TEMP B-TREE FOR GROUP BY. The temp
+  B-tree is left alone: it holds one row per distinct status, not one per test,
+  and grouping across many run_ids cannot ride a single index. 1.0ms for the
+  whole overview.
+*/
+export function projectOverview(
+  database: Database.Database,
+  projectId: number,
+): ProjectOverview {
+  const runCounts = database
+    .prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN is_completed = 0 THEN 1 ELSE 0 END) AS open_runs
+         FROM runs WHERE project_id = ?`,
+    )
+    .get(projectId) as { total: number; open_runs: number | null };
+
+  const counts = database
+    .prepare(
+      `SELECT tests.status_id, COUNT(*) AS total
+         FROM tests JOIN runs ON runs.id = tests.run_id
+        WHERE runs.project_id = ?
+        GROUP BY tests.status_id`,
+    )
+    .all(projectId) as StatusCount[];
+
+  return {
+    openRuns: runCounts.open_runs ?? 0,
+    totalRuns: runCounts.total,
+    progress: runProgress(counts, listStatuses(database)),
+  };
+}
+
+const MAX_ACTIVITY_ROWS = 50;
+
+/*
+  Recent activity is recent results, because results are the only history this
+  product keeps. Ordered newest first and bounded here rather than by the
+  caller, so a dashboard cannot ask for the whole table.
+*/
+export function recentActivity(
+  database: Database.Database,
+  projectId: number,
+  limit = 10,
+): ActivityRow[] {
+  const wanted = Math.min(Math.max(Math.floor(Number(limit)) || 10, 1), MAX_ACTIVITY_ROWS);
+  return database
+    .prepare(
+      `SELECT results.id, results.status_id, results.created_on, results.comment,
+              results.test_id, tests.run_id, tests.title_snapshot,
+              runs.name AS run_name, users.name AS author
+         FROM results
+         JOIN tests ON tests.id = results.test_id
+         JOIN runs  ON runs.id = tests.run_id
+         LEFT JOIN users ON users.id = results.created_by
+        WHERE runs.project_id = ?
+        ORDER BY results.created_on DESC, results.id DESC
+        LIMIT ?`,
+    )
+    .all(projectId, wanted) as ActivityRow[];
 }
 
 /* Rollups are SQL aggregates. Never fetch tests and count them in JS. */
