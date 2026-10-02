@@ -5,9 +5,10 @@
   second place for the rule to live.
 */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { UserRole } from "@/lib/format";
 
 const directory = mkdtempSync(join(tmpdir(), "minitcms-routes-"));
 process.env.SQLITE_FILE = join(directory, "routes.db");
@@ -48,9 +49,24 @@ const ROUTE_MODULES = import.meta.glob("./**/route.ts") as Record<
 
 const routeFiles = (): string[] => Object.keys(ROUTE_MODULES).sort();
 
-// Query parameters every list route might want, and a body with one of every
-// required field shape. Neither should matter: the session check comes first,
-// and a route that validates before it authenticates fails this test.
+// Counted a second way, from disk, because the sweep is only worth as much as
+// the glob behind it: a pattern that quietly stops matching would shrink the
+// sweep to nothing and every assertion in it would still pass.
+function routeFilesOnDisk(): number {
+  let total = 0;
+  const walk = (directoryPath: string) => {
+    for (const entry of readdirSync(directoryPath, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(join(directoryPath, entry.name));
+      else if (entry.name === "route.ts") total += 1;
+    }
+  };
+  walk("app/api");
+  return total;
+}
+
+// Query parameters every list route might want, and an empty JSON body.
+// Neither should matter: the credential check comes first, and a route that
+// validates its input before it authenticates answers 400 and fails this test.
 function requestFor(method: string): Request {
   const url = "http://localhost/api/thing?projectId=1&suiteId=1&runId=1&limit=5";
   return new Request(url, {
@@ -136,8 +152,8 @@ afterAll(() => {
 });
 
 describe("every route needs a credential", () => {
-  it("finds the route files to sweep", () => {
-    expect(routeFiles().length).toBeGreaterThan(20);
+  it("sweeps every route file that exists on disk", () => {
+    expect(routeFiles().length).toBe(routeFilesOnDisk());
   });
 
   for (const file of routeFiles()) {
@@ -349,4 +365,73 @@ describe("results by case id", () => {
     const response = await post({ runId, results: [{ testId, caseId, statusId: 1 }] });
     expect(response.status).toBe(400);
   });
+});
+
+/*
+  The rung every write path needs, asserted from both sides: refused one rung
+  below, and not refused at its own. One side alone is not enough - a guard set
+  too low fails open, a guard set too high is a screen nobody can use, and a
+  guard with no test that fires is a guard that quietly stops working.
+
+  This block runs last: deleting run 1 is one of the paths it exercises.
+*/
+describe("the rung each write path needs", () => {
+  const WRITE_PATHS: { file: string; method: string; needs: UserRole; body?: unknown }[] = [
+    { file: "./projects/route.ts", method: "POST", needs: "lead", body: { name: "P" } },
+    { file: "./projects/[id]/route.ts", method: "PATCH", needs: "lead", body: { name: "P" } },
+    { file: "./suites/route.ts", method: "POST", needs: "lead", body: { projectId: 1, name: "S" } },
+    { file: "./suites/[id]/route.ts", method: "PATCH", needs: "lead", body: { name: "S" } },
+    { file: "./sections/route.ts", method: "POST", needs: "lead", body: { suiteId: 1, name: "Sec" } },
+    { file: "./sections/[id]/route.ts", method: "PATCH", needs: "lead", body: { name: "Sec" } },
+    { file: "./cases/route.ts", method: "POST", needs: "lead", body: { suiteId: 1, title: "C" } },
+    { file: "./cases/[id]/route.ts", method: "PATCH", needs: "lead", body: { title: "C" } },
+    { file: "./cases/bulk/route.ts", method: "POST", needs: "lead", body: { caseIds: [1], typeId: 1 } },
+    { file: "./milestones/route.ts", method: "POST", needs: "lead", body: { projectId: 1, name: "M" } },
+    { file: "./milestones/[id]/route.ts", method: "PATCH", needs: "lead", body: { name: "M" } },
+    { file: "./plans/route.ts", method: "POST", needs: "lead", body: { projectId: 1, name: "Pl" } },
+    { file: "./plans/[id]/route.ts", method: "PATCH", needs: "lead", body: { name: "Pl" } },
+    { file: "./runs/route.ts", method: "POST", needs: "lead", body: { projectId: 1, suiteId: 1, name: "R", includeAll: true } },
+    { file: "./runs/[id]/route.ts", method: "PATCH", needs: "lead", body: { name: "R" } },
+    { file: "./runs/[id]/tests/assign/route.ts", method: "POST", needs: "lead", body: { testIds: [1], assignedTo: null } },
+    { file: "./case-fields/route.ts", method: "POST", needs: "admin", body: { systemName: "f", label: "F", type: "string" } },
+    { file: "./migrate/route.ts", method: "GET", needs: "admin" },
+    { file: "./migrate/[id]/route.ts", method: "GET", needs: "admin" },
+    { file: "./migrate/csv/route.ts", method: "POST", needs: "admin", body: {} },
+    // Last, because it takes the run the entries above lean on. A 404 after it
+    // is still not a 403, which is all this block asserts.
+    { file: "./cases/[id]/route.ts", method: "DELETE", needs: "lead" },
+    { file: "./runs/[id]/route.ts", method: "DELETE", needs: "admin" },
+  ];
+
+  const BELOW: Record<UserRole, string> = { tester: "", lead: "tester", admin: "lead" };
+
+  async function callAs(cookie: string, entry: (typeof WRITE_PATHS)[number]): Promise<number> {
+    const loaded = ROUTE_MODULES[entry.file];
+    expect(loaded, `no route module for ${entry.file}`).toBeDefined();
+    const handlers = await loaded();
+    context.cookie = cookie;
+    context.authorization = undefined;
+    const response = await handlers[entry.method](
+      new Request("http://localhost/api/thing?projectId=1&suiteId=1&runId=1", {
+        method: entry.method,
+        headers: entry.body === undefined ? undefined : { "content-type": "application/json" },
+        body: entry.body === undefined ? undefined : JSON.stringify(entry.body),
+      }),
+      { params: Promise.resolve({ id: "1" }) },
+    );
+    return response.status;
+  }
+
+  const cookieFor = (role: string) =>
+    role === "tester" ? testerCookie : role === "lead" ? leadCookie : adminCookie;
+
+  for (const entry of WRITE_PATHS) {
+    it(`${entry.method} ${entry.file} needs ${entry.needs}`, async () => {
+      const below = BELOW[entry.needs];
+      expect(await callAs(cookieFor(below), entry)).toBe(403);
+      const allowed = await callAs(cookieFor(entry.needs), entry);
+      expect(allowed).not.toBe(403);
+      expect(allowed).not.toBe(401);
+    });
+  }
 });

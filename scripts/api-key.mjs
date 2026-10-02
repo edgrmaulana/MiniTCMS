@@ -19,7 +19,11 @@ import {
 import { createApiKey, isValidEmail } from "../lib/auth.ts";
 
 const [command, ...rest] = process.argv.slice(2);
-const database = openDb(process.env.SQLITE_FILE ?? "./data.db");
+
+// Opened on demand, after the arguments are known to be usable: a typo in a
+// subcommand should not create a database file as a side effect.
+let connection = null;
+const db = () => (connection ??= openDb(process.env.SQLITE_FILE ?? "./data.db"));
 
 try {
   if (command === "add") await add(...rest);
@@ -42,7 +46,7 @@ async function add(email, ...nameParts) {
   const name = nameParts.join(" ").trim();
   if (!email || !isValidEmail(email) || !name) usage();
 
-  const owner = findUserByEmail(database, email);
+  const owner = findUserByEmail(db(), email);
   if (!owner) {
     console.error(`No user with email ${email}. Create one with npm run user:add first.`);
     process.exit(1);
@@ -53,7 +57,7 @@ async function add(email, ...nameParts) {
   }
 
   const { key, keyHash } = createApiKey();
-  const id = insertApiKey(database, { userId: owner.id, name, keyHash });
+  const id = insertApiKey(db(), { userId: owner.id, name, keyHash });
   // Printed once. Only the hash is stored, so there is no second chance and no
   // "show key" command to write later.
   console.log(`Created key ${id} for ${owner.email} (${owner.role})`);
@@ -64,14 +68,14 @@ async function add(email, ...nameParts) {
 function list(email) {
   let userId;
   if (email) {
-    const owner = findUserByEmail(database, email);
+    const owner = findUserByEmail(db(), email);
     if (!owner) {
       console.error(`No user with email ${email}`);
       process.exit(1);
     }
     userId = owner.id;
   }
-  const { rows, total } = listApiKeys(database, { userId, limit: 100 });
+  const { rows, total } = listApiKeys(db(), { userId, limit: 100 });
   if (total === 0) {
     console.log("No API keys");
     return;
@@ -88,7 +92,7 @@ function list(email) {
 function revoke(id) {
   const keyId = Number(id);
   if (!Number.isInteger(keyId) || keyId < 1) usage();
-  revokeApiKey(database, keyId);
+  revokeApiKey(db(), keyId);
   console.log(`Revoked key ${keyId}`);
 }
 

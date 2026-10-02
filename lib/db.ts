@@ -704,7 +704,9 @@ export function touchApiKey(database: Database.Database, id: number): void {
 */
 export function listApiKeys(
   database: Database.Database,
-  options: ListOptions & { userId?: number } = {},
+  // No search: this list is read by an operator who knows what they minted, and
+  // a `search` in the type that the query ignores is a silent lie to the caller.
+  options: Omit<ListOptions, "search"> & { userId?: number } = {},
 ): ListResult<ApiKeyRow> {
   const where = options.userId === undefined ? "" : "WHERE api_keys.user_id = ?";
   const filter = options.userId === undefined ? [] : [options.userId];

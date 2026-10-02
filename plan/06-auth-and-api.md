@@ -265,7 +265,14 @@ Added in `app/api/routes.test.ts`, `lib/db.test.ts` and
   `import.meta.glob`, every handler it exports, no cookie and no key, one
   assertion: `401`. A route that validated its input before checking the
   session would answer `400` and fail this. A session token that is not
-  in the database is refused too.
+  in the database is refused too. The file count is taken a second time
+  from disk and the two must match, because a glob that quietly stopped
+  matching would shrink the sweep to nothing and still pass.
+- **The rung table.** Every write path paired with the role it needs, and
+  asserted from both sides: refused one rung below, not refused at its own.
+  One side alone is not enough - a rung set too low fails open, one set too
+  high is a screen nobody can use. Checked by mutation: dropping
+  `POST /api/cases/bulk` back to any session fails this test.
 - `tester` editing a case is `403`; `tester` creating a run is `403` and
   `lead` is `201`; `lead` listing imports is `403` and `admin` is `200`;
   `lead` deleting a run is `403`; `tester` recording a result is `201`,
