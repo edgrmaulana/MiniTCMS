@@ -180,6 +180,19 @@ export function idListParam(url: URL, name: string): number[] | undefined {
   return entries.map((entry) => routeId(entry));
 }
 
+/*
+  A boolean in a query string, strictly. "true" and "false" only: anything else
+  is a typo, and reading a typo as false is how a caller ends up looking at the
+  opposite of what they asked for.
+*/
+export function optionalFlag(url: URL, name: string): boolean | undefined {
+  const raw = url.searchParams.get(name);
+  if (raw === null) return undefined;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new BadRequestError(`${name} must be true or false`);
+}
+
 export function listOptionsFrom(url: URL) {
   return {
     search: url.searchParams.get("search"),

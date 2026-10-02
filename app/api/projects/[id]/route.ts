@@ -1,4 +1,4 @@
-import { getDb, getProject, updateProject } from "@/lib/db";
+import { getDb, getProject, projectOverview, updateProject } from "@/lib/db";
 import {
   BadRequestError,
   handle,
@@ -15,8 +15,13 @@ type Context = { params: Promise<{ id: string }> };
 export async function GET(_request: Request, context: Context): Promise<Response> {
   return handle(async () => {
     await requireUser();
-    const project = getProject(getDb(), routeId((await context.params).id));
-    return project ? Response.json(project) : problem(404, "No such project");
+    const database = getDb();
+    const id = routeId((await context.params).id);
+    const project = getProject(database, id);
+    if (!project) return problem(404, "No such project");
+    // The dashboard's numbers ride along: it needs the name and the rollup in
+    // the same breath, and both come from one project id.
+    return Response.json({ ...project, overview: projectOverview(database, id) });
   });
 }
 
