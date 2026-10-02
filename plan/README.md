@@ -18,7 +18,7 @@ and *when*; AGENTS.md is the *how*.
 | 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | done, bar attachments |
 | 5 | `05-ui.md` | App shell and the five screens that make it usable | done |
 | 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | done, bar user management |
-| 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | not started |
+| 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | done, bar the tag |
 
 Each phase file opens with its own status and a per-section breakdown.
 Update them in the same turn the work lands, or this table starts
@@ -77,6 +77,20 @@ the whole target.
 - **API keys are credentials, not identities.** A key's role is read off
   its owner's row on every request, so it can never outlive or outrank
   the account that made it.
+- **MIT, held by "MiniTCMS contributors."** Decided in phase 7, before
+  the first public release, because relicensing later needs every
+  contributor's agreement. A project name rather than a person's means a
+  second contributor changes no header.
+- **No signing secret in the env surface.** Phase 7's packaging list
+  originally carried an `AUTH_SECRET`; there is nothing for it to
+  protect, because a session is random and the database holds only its
+  hash. An unused variable that looks like a security control is worse
+  than no variable.
+- **The container ships the CLI, not just the server.** Creating the
+  first account, minting a key and running an import are node scripts
+  over `lib/*.ts`, so the image carries `lib/`, `scripts/` and the
+  production `node_modules` instead of a smaller standalone bundle that
+  could not run any of them.
 - **The visual language is set by the login page**: night-sky palette,
   Archivo for UI, Fraunces for display, all as CSS variables in
   `app/globals.css`. Phase 5 inherits it rather than re-deciding.
@@ -85,9 +99,11 @@ the whole target.
 
 - Attachment storage: local disk vs S3-compatible. **Answered in phase
   3**: local disk behind `saveAttachment`, `ATTACHMENTS_DIR`, one
-  implementation. Still open is the *import* side — phase 4 brings the
-  rows across but not the bytes, which is a second API call per row and
-  a disk budget nobody has set a number for.
+  implementation. Still open is the *import* side — phase 4 brings
+  neither the rows nor the bytes across: the bytes are a second API call
+  per attachment and a disk budget nobody has set a number for, and a
+  row pointing at a file that was never fetched is a broken link, so the
+  stage is reported as not built rather than half-done.
 - TestRail "baselines" (`suite_mode` 2): **still open.** Phase 4 carries
   the `is_baseline` flag over and leaves `baseline_of` NULL with a
   report line, because `get_suites` does not say which suite a baseline

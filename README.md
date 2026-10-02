@@ -12,8 +12,10 @@ whole TestRail instance from the CLI, browse the case tree, edit a case, then
 open a run and record pass, fail, retest or blocked against every test from
 the keyboard. The dashboard says how much of a project has been executed and
 what was recorded last. A CI job gets an API key and reports results by case
-id in one call. Creating projects, suites and runs is still an API call -
-those forms are the next cut.
+id in one call. It runs from a container with one volume behind it, and the
+tag is held back until the import has run against a real TestRail instance.
+Creating projects, suites and runs is still an API call - those forms are the
+next cut.
 
 | Phase | | |
 |---|---|---|
@@ -23,13 +25,31 @@ those forms are the next cut.
 | 4 | TestRail migration — client, CSV reader, mapping, resumable import | **done**, bar attachments |
 | 5 | UI — app shell and the five screens | **done** |
 | 6 | Auth and public API — login, roles, REST API, CI reporters | **done**, bar user management |
-| 7 | Release — Docker, CI, license, contributor docs | not started |
+| 7 | Release — Docker, CI, license, contributor docs | **done**, bar the v0.1.0 tag |
 
 Each phase has its own file in [`plan/`](plan/), opening with its status
 and a per-section breakdown. Start at [`plan/README.md`](plan/README.md).
 Rules for working in this repo are in [`AGENTS.md`](AGENTS.md).
 
 ## Run
+
+Three commands, with Docker:
+
+```bash
+docker compose up -d --build
+
+# The first account. The password is read from stdin, so -it matters.
+docker compose exec -it app npm run user:add -- you@example.com admin
+
+open http://localhost:3000/login
+```
+
+State lives in one named volume, `minitcms-data`: the database file and the
+uploaded attachments both sit under `/app/data`. Back that volume up and you
+have backed up the instance. Env vars are documented inline in
+[`docker-compose.yml`](docker-compose.yml) and in Configuration below.
+
+From source instead:
 
 ```bash
 npm install
@@ -103,7 +123,10 @@ version moves, an older database is refused on open, untouched — delete
 
 TestRail credentials go in `.env.local`, never in the repo. The key is
 an API key, which TestRail issues per user under *My Settings → API
-Keys* — not the account password.
+Keys* — not the account password. That is the whole env surface: there is
+no signing secret to set, because a session is a random token whose hash
+is what the database holds, so there is nothing for a secret to protect
+and nothing to rotate.
 
 **`TRUSTED_PROXY_HOPS` is a security setting, not a convenience.** Next
 passes the caller's `x-forwarded-for` header straight through rather
@@ -330,6 +353,10 @@ MIGRATION must be replayable.
 
 ## TestRail migration
 
+The step-by-step version is [`docs/migration.md`](docs/migration.md) —
+getting a key, the dry run, reading the report, resuming a dead import.
+What follows is the shape of it.
+
 Two entry points of equal weight: the API v2, and a case CSV export. A
 CSV needs no plan tier and no admin willing to issue a key, so it is
 what a team can always produce — it is not a degraded mode and it has
@@ -379,10 +406,11 @@ with the CSV, then start the real API import on a fresh project.
 
 ### Not built
 
-- **Attachments.** Rows are imported, but their bytes are not fetched —
-  that is a second call per row and a disk budget nobody has set. Every
-  import says so in its report. A CSV export never had the bytes at all,
-  so a non-empty `Attachments` cell is a reported skip.
+- **Attachments.** The API path fetches neither the bytes nor the rows:
+  the bytes are a second call per attachment and a disk budget nobody has
+  set, and a row without its file is a broken link. Every import says so
+  in its report. A CSV export never had the bytes at all, so a non-empty
+  `Attachments` cell is a reported skip naming the case.
 - **Steps-template CSV exports**, which spread one case over several
   rows. A file with any `Steps (…)` column filled refuses to import
   rather than reading half of it. API imports carry steps fine.
@@ -396,5 +424,7 @@ with the CSV, then start the real API import on a fresh project.
 
 ## License
 
-TBD before the first public release — see
-[`plan/07-release.md`](plan/07-release.md).
+MIT. See [`LICENSE`](LICENSE).
+
+Patches welcome — [`CONTRIBUTING.md`](CONTRIBUTING.md) is short and points
+at [`AGENTS.md`](AGENTS.md), which is where the rules actually live.

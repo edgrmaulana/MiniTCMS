@@ -6,7 +6,7 @@ data. Treat a lost field as a bug of the same severity as a crash.
 Depends on phases 1-3. Blocks nothing — but nothing else matters if this
 is wrong.
 
-**Status: done, bar attachment bytes.** Both entry points ship: the API
+**Status: done, bar attachments.** Both entry points ship: the API
 v2 client with its pipeline, and the CSV reader with its own. 97 new
 tests. Schema v9 added two indexes, both after measuring.
 
@@ -62,8 +62,12 @@ column an instance has that nobody anticipated.
 Three things are deliberately not built, each reported by every import
 that touches them rather than left silent:
 
-- **Attachment bytes.** The rows come across; the files do not. That is
-  a second call per row and a disk budget nobody has set a number for.
+- **Attachments.** Neither the rows nor the files come across on the API
+  path: the bytes are a second call per attachment and a disk budget
+  nobody has set a number for, and an attachment row whose file was
+  never fetched is a broken link in the UI. Stage 15 below is the
+  unbuilt stage, and every import carries a note saying so. The CSV path
+  reports each non-empty `Attachments` cell as a skip with the case id.
 - **`suite_mode` 2 baselines.** `is_baseline` carries over and
   `baseline_of` stays NULL, because `get_suites` does not say which
   suite a baseline came from.

@@ -1,0 +1,16 @@
+# Everything the image builds for itself, plus everything that is local state.
+node_modules
+.next
+.git
+.idea
+*.iml
+data.db
+data.db-wal
+data.db-shm
+data/
+.env
+.env.*
+.DS_Store
+*.tsbuildinfo
+.agents
+skills-lock.json
