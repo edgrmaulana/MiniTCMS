@@ -1,0 +1,31 @@
+# One app, one volume, nothing else. A reverse proxy, TLS and backups are
+# deployment decisions; none of them is needed to get a first instance up.
+services:
+  app:
+    build: .
+    ports:
+      # Every interface the host has, which is what a self-host wants and also
+      # what puts a sign-in page on the internet. TLS and a proxy in front of
+      # it are yours to add; bind "127.0.0.1:3000:3000" while you decide.
+      - "3000:3000"
+    volumes:
+      # The database file and the attachment bytes, in one place to back up.
+      - minitcms-data:/app/data
+    environment:
+      SQLITE_FILE: /app/data/data.db
+      ATTACHMENTS_DIR: /app/data/attachments
+      # How many reverse proxies you run in front of this. At 0 the per-address
+      # login throttle is off rather than run against a header the client picks;
+      # set it to 1 behind one proxy you own. See README, Configuration.
+      TRUSTED_PROXY_HOPS: 0
+      # Upload cap in bytes, default 32MB.
+      # MAX_ATTACHMENT_BYTES: 33554432
+      # TestRail credentials are only read by the import CLI, and the import is
+      # a terminal job - pass them on the command that runs it rather than
+      # keeping them in the server's environment:
+      #   docker compose run --rm -e TESTRAIL_HOST=... -e TESTRAIL_USER=... \
+      #     -e TESTRAIL_API_KEY=... app npm run migrate -- --dry-run
+    restart: unless-stopped
+
+volumes:
+  minitcms-data:
