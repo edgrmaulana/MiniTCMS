@@ -3,20 +3,27 @@
 Goal: stop the instance being wide open, and give CI a way to report
 results.
 
-**Status: partial.** Sign-in works today, ahead of its phase.
+**Status: done.** Sign-in shipped ahead of its phase; roles, keys and the
+CI path landed together, because a role model decided one route at a time
+is a role model with holes in it.
 
 | Section | State |
 |---------|-------|
 | 1 Login | done |
 | 2 Login page design | done |
-| 3 Roles | partial - `USER_ROLES` and the column CHECK exist, `requireRole` does not |
-| 4 Imported users | done at the schema level, untested until phase 4 |
-| 5 API keys | not started |
-| 6 CI endpoints | not started |
-| 7 Tests | partial - auth covered, route authorisation not |
+| 3 Roles | done - ranked in `lib/format.ts`, enforced on every route |
+| 4 Imported users | done |
+| 5 API keys | done - `api_keys`, bearer auth, `npm run key` |
+| 6 CI endpoints | done - results by case id, rate limited by key |
+| 7 Tests | done - 401 swept over every route file, 403 and key paths covered |
 
 Done when: every route requires a session or an API key, and a CI job
-can post results for a run with a single authenticated call.
+can post results for a run with a single authenticated call. Both hold.
+
+Left for later, deliberately: account management from a screen (add a
+user, change a password, reset somebody else's, list and kill sessions)
+and a keys screen. Both are CLI-only today, which is enough for a
+single-org self-host where the admin has the box.
 
 ---
 
@@ -35,6 +42,9 @@ from the TestRail import.
 | `app/login/login-form.tsx` | the form, `useActionState` |
 | `app/login/aurora.tsx` | WebGL2 hero |
 | `scripts/create-user.mjs` | `npm run user:add` bootstrap |
+| `app/api/helpers.ts` | `requireUser` (cookie then key), `requireRole`, 429 |
+| `lib/rate-limit.ts` | per-key fixed window |
+| `scripts/api-key.mjs` | `npm run key -- add/list/revoke` |
 
 ### Security decisions, and why
 
@@ -93,8 +103,14 @@ from the TestRail import.
 - Expired sessions are swept on sign-in rather than on a schedule. Good
   enough while people log in; a cron is the upgrade if an instance ever
   goes months between sign-ins.
-- `middleware.ts` so new routes are protected by default rather than by
-  remembering to call `currentUser()`.
+- ~~`middleware.ts` so new routes are protected by default~~. Answered
+  without one: `app/api/routes.test.ts` walks every `route.ts` under
+  `app/api` with `import.meta.glob`, calls every handler it exports with
+  no cookie and no key, and requires `401` from each. A route added later
+  is covered the day it lands, and the rule stays in one place instead of
+  being split between a matcher and the handlers. A middleware would also
+  have had to re-read the session per request in the node runtime for no
+  gain.
 
 ## 2. The login page design — SHIPPED
 
@@ -136,9 +152,38 @@ a fourth one from somebody's custom field:
 - `lead` — create and close runs, edit cases, no user management.
 - `tester` — read cases, record results. Cannot delete.
 
-To build: one `requireRole(session, role)` helper called at the top of
-each route. No permission matrix, no per-project ACL, no custom roles
-until someone asks with a real reason.
+Shipped as a **ladder, not a set**: `ROLE_RANK` in `lib/format.ts` plus
+`roleAtLeast(role, minimum)`, and `requireRole(minimum)` in
+`app/api/helpers.ts` names the rung a route needs. A list of acceptable
+roles is the thing somebody forgets to extend when a fourth role lands,
+and forgetting it fails open.
+
+Where each rung lands:
+
+| Rung | Routes |
+|---|---|
+| `tester` (any session) | every `GET`, `POST /api/results`, `POST /api/runs/[id]/tests/status`, `POST /api/attachments` |
+| `lead` | writes to projects, suites, sections, cases, bulk case edits, milestones, plans, `POST /api/runs`, `PATCH /api/runs/[id]`, `POST /api/runs/[id]/tests/assign` |
+| `admin` | `DELETE /api/runs/[id]`, `POST /api/case-fields`, every `/api/migrate` route |
+
+Three deviations from the sketch above, each for a reason:
+
+- **The import is admin-only**, not admin-or-lead as the first cut of the
+  routes had it. It writes across every project in the instance and can
+  overwrite migrated rows in all of them.
+- **A custom field definition is admin.** It is the shape of every case in
+  the instance, not one case's content - the same rung as an import.
+- **Closing and reopening a run are the same rung.** The earlier split
+  (lead closes, admin reopens) made a lead unable to undo their own
+  mistake, which is not a safety property, just an errand for somebody
+  else.
+
+The role check runs **before the body is read**, so a refusal never
+depends on the payload parsing. Screens hide what a role cannot use -
+the bulk bar on `/cases`, Save on a case, Close on a run, the Import link
+in the rail - and every route checks again regardless.
+
+Still no permission matrix, no per-project ACL, no custom roles.
 
 ## 4. Imported users
 
@@ -147,29 +192,63 @@ an admin sets a password — a NULL hash never verifies, it does not match
 an empty password. They exist so results attribute correctly, which is
 the only reason phase 4 imports them.
 
-## 5. API keys — TO BUILD
+## 5. API keys — SHIPPED
 
-- Per-user keys for CI, `Authorization: Bearer <key>`. Generated like a
-  session token and stored the same way: SHA-256 hash only, shown once
-  at creation.
-- Same role checks as a session. A key cannot do more than its owner.
-- `last_used_on` recorded so dead keys can be found and revoked.
+`api_keys(user_id, name, key_hash, created_on, last_used_on, revoked_on)`,
+schema version 11.
 
-## 6. CI-facing endpoints — TO BUILD
+- `Authorization: Bearer mtk_...`, 256 bits of `randomBytes` behind a
+  visible prefix so a key that leaks into a log can be grepped for and
+  recognised. Only the SHA-256 hash is stored, so minting prints it once
+  and there is no command that can show it again.
+- **A key carries no permissions of its own.** `findApiKeyUser` joins
+  `users` and takes the role from there, so demoting an account demotes
+  its keys, and deactivating one kills them.
+- **Revoking is a timestamp, not a delete**: a key that ran for six
+  months stays in the audit trail after it stops working. Revoking twice
+  is a `409`, not a success that changed nothing.
+- `last_used_on` is stamped by one `UPDATE` with the staleness in the
+  `WHERE`, at most once a minute per key. Writing on every request would
+  have put a write on the read path, which is what SQLite serialises on.
+- **Rate limited per key**: 300 requests a minute, `429` with
+  `Retry-After` over that. Fixed window in `lib/rate-limit.ts`, in the
+  app process and not in a table - a counter row per request is the
+  problem rather than the fix. The ceiling is written down: two processes
+  get an allowance each, and the upgrade is a bucket table keyed by
+  `(key_hash, window_start)`. A session cookie is never rate limited.
+- **CLI, not a screen**: `npm run key -- add|list|revoke`. Minting a
+  credential is an operator action that happens once per CI job, and a
+  key printed into a terminal does not pass through a browser history or
+  a React state tree on the way.
+
+## 6. CI-facing endpoints — SHIPPED
 
 ```text
-POST  /api/runs                     # create a run from a case filter
+POST  /api/runs                     # create a run from a case filter   (lead)
 POST  /api/results                  # bulk results, by test id or case id
-PATCH /api/runs/[id]                # close the run
+PATCH /api/runs/[id]                # close the run                     (lead)
 GET   /api/runs/[id]/summary
 ```
 
-`POST /api/results` accepts `case_id` as well as `test_id` so a reporter
-does not have to resolve test ids first. That resolution happens in
-`lib/db.ts` in the same transaction as the insert.
+All four existed from phase 3; what phase 6 added is the credential, the
+role, and `caseId`:
 
-Rate limit by key: a runaway CI job should get 429, not take the
-instance down.
+```json
+{ "runId": 12, "results": [{ "caseId": 1041, "statusId": 1 }] }
+```
+
+`runId` may sit at the top level or on each entry. Resolution happens in
+`resolveResultTargets` inside the same transaction as the insert, so the
+test a result lands on cannot change between the lookup and the write. A
+case that is not in the run is a `404` naming both ids. An entry carrying
+both a `testId` and a `caseId` is a `400` rather than a precedence rule -
+accepting both and preferring one means a reporter with a stale test id
+silently records against the wrong test.
+
+Measured over 200,000 tests (20,000 cases across 10 runs): the lookup
+rides `idx_tests_case` at 0.002ms, and 500 results posted by case id take
+3.6ms against 2.6ms by test id. One millisecond for the batch is the
+price of not making CI resolve ids first.
 
 ## 7. Tests
 
@@ -179,14 +258,52 @@ malformed hashes returning false instead of throwing, token uniqueness
 and hashing, email and password validation, expired sessions, sessions
 for deactivated and deleted users, and the attempt window.
 
-Still to write:
+Added in `app/api/routes.test.ts`, `lib/db.test.ts` and
+`lib/rate-limit.test.ts`:
 
-- Unauthenticated request to every route shape returns 401.
-- `tester` posting a case edit returns 403.
-- Bulk results by `case_id` resolve to the right tests in the right run.
-- API key hash never appears in any response body.
+- **The 401 sweep.** Every `route.ts` under `app/api`, found with
+  `import.meta.glob`, every handler it exports, no cookie and no key, one
+  assertion: `401`. A route that validated its input before checking the
+  session would answer `400` and fail this. A session token that is not
+  in the database is refused too. The file count is taken a second time
+  from disk and the two must match, because a glob that quietly stopped
+  matching would shrink the sweep to nothing and still pass.
+- **The rung table.** Every write path paired with the role it needs, and
+  asserted from both sides: refused one rung below, not refused at its own.
+  One side alone is not enough - a rung set too low fails open, one set too
+  high is a screen nobody can use. Checked by mutation: dropping
+  `POST /api/cases/bulk` back to any session fails this test.
+- `tester` editing a case is `403`; `tester` creating a run is `403` and
+  `lead` is `201`; `lead` listing imports is `403` and `admin` is `200`;
+  `lead` deleting a run is `403`; `tester` recording a result is `201`,
+  because that is the job.
+- A bearer key authenticates; a revoked key, a key whose owner was
+  deactivated, and a made-up key are all `401`. A key gets exactly its
+  owner's role. A cookie wins over a bearer header when both are sent.
+- `listApiKeys` never returns `key_hash`, and no row serialises anything
+  starting `mtk_`.
+- `touchApiKey` stamps, then leaves the stamp alone inside the window.
+- An exhausted key answers `429` with a positive `Retry-After`, on its
+  own allowance, while another key and the cookie path are unaffected.
+- Results by case id: resolved to the right test, `404` for a case that
+  is not in the run, `400` for a case id with no run and for an entry
+  naming both ids.
+
+`vitest.config.mts` exists only so a test can import a route the way the
+route imports itself - vitest does not read tsconfig paths, and the
+routes use `@/lib/...`.
 
 ## 8. Checks
 
 `npm run test`, `npm run lint`, `npm run build`, plus a manual pass of
 the auth flow in a fresh browser profile.
+
+Phase 6 was verified live as well, against `next start` on a seeded
+database rather than only through mocked headers: no credential `401`,
+bogus bearer `401`, lead key `200`, tester editing a case `403`, lead
+editing it `200`, tester closing a run `403`, lead deleting a run `403`,
+lead listing imports `403`, admin `200`, tester key creating a run `403`,
+lead key `201`, a result posted by case id `{"recorded":1}`, an unknown
+case `Case 99999 is not in run 1`, and 310 requests on one key answering
+299 x `200` then `429` with `Retry-After: 50` while the cookie path stayed
+`200`.

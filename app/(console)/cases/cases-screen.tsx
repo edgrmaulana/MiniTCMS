@@ -13,10 +13,12 @@ import {
   clampPage,
   clampPageSize,
   labelFor,
+  roleAtLeast,
   type CaseRow,
   type ListResult,
   type SectionTreeRow,
   type SuiteRow,
+  type UserRole,
 } from "@/lib/format";
 import { selectRange, toggleAll, toggleSelected } from "@/lib/selection";
 import { fetchJson, postJson } from "../../fetch-json";
@@ -34,7 +36,10 @@ const SEARCH_DEBOUNCE_MS = 300;
   filters or sorts a fetched array; a suite holding 50k cases must cost the
   same as one holding 50.
 */
-export default function CasesScreen() {
+export default function CasesScreen({ role }: { role: UserRole }) {
+  // Editing a case is lead work. A tester still selects rows - selection is how
+  // you read a long list - but is not handed controls the API would refuse.
+  const mayEdit = roleAtLeast(role, "lead");
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -314,33 +319,39 @@ export default function CasesScreen() {
         {selected.size > 0 ? (
           <div className="flex flex-wrap items-center gap-3 border-b border-line bg-[rgba(47,224,168,0.06)] px-5 py-2">
             <p className="text-xs text-ink">{selected.size} selected</p>
-            <BulkPicker
-              label="Move to section"
-              disabled={busy}
-              options={sections.map((section) => ({
-                value: section.id,
-                label: `${"- ".repeat(section.depth)}${section.name}`,
-              }))}
-              onPick={(value) => applyToSelection({ sectionId: value })}
-            />
-            <BulkPicker
-              label="Set type"
-              disabled={busy}
-              options={Object.values(CASE_TYPE).map((id) => ({
-                value: id,
-                label: labelFor(CASE_TYPE_LABELS, id),
-              }))}
-              onPick={(value) => applyToSelection({ typeId: value })}
-            />
-            <BulkPicker
-              label="Set priority"
-              disabled={busy}
-              options={Object.values(CASE_PRIORITY).map((id) => ({
-                value: id,
-                label: labelFor(CASE_PRIORITY_LABELS, id),
-              }))}
-              onPick={(value) => applyToSelection({ priorityId: value })}
-            />
+            {mayEdit ? (
+              <>
+                <BulkPicker
+                  label="Move to section"
+                  disabled={busy}
+                  options={sections.map((section) => ({
+                    value: section.id,
+                    label: `${"- ".repeat(section.depth)}${section.name}`,
+                  }))}
+                  onPick={(value) => applyToSelection({ sectionId: value })}
+                />
+                <BulkPicker
+                  label="Set type"
+                  disabled={busy}
+                  options={Object.values(CASE_TYPE).map((id) => ({
+                    value: id,
+                    label: labelFor(CASE_TYPE_LABELS, id),
+                  }))}
+                  onPick={(value) => applyToSelection({ typeId: value })}
+                />
+                <BulkPicker
+                  label="Set priority"
+                  disabled={busy}
+                  options={Object.values(CASE_PRIORITY).map((id) => ({
+                    value: id,
+                    label: labelFor(CASE_PRIORITY_LABELS, id),
+                  }))}
+                  onPick={(value) => applyToSelection({ priorityId: value })}
+                />
+              </>
+            ) : (
+              <p className="text-xs text-muted">Editing cases needs the lead role</p>
+            )}
             <button type="button" className="chip" onClick={() => setSelected(new Set())}>
               Clear
             </button>

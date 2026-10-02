@@ -1,7 +1,8 @@
-import { currentUser } from "@/lib/session";
-import { CaseFieldError, type SessionUser, type UserRole } from "@/lib/format";
+import { apiKeyUser, currentUser } from "@/lib/session";
+import { CaseFieldError, roleAtLeast, type SessionUser, type UserRole } from "@/lib/format";
+import { takeApiToken } from "@/lib/rate-limit";
 import { AttachmentTooLargeError } from "@/lib/attachments";
-import { ConflictError, MAX_BULK_IDS, NotFoundError } from "@/lib/db";
+import { ConflictError, MAX_BULK_IDS, NotFoundError, nowSeconds } from "@/lib/db";
 import { MappingError } from "@/lib/migrate/map";
 
 /*
@@ -17,24 +18,55 @@ export function problem(status: number, message: string): Response {
   return Response.json({ error: message }, { status });
 }
 
-export async function requireUser(): Promise<SessionUser> {
-  const user = await currentUser();
-  if (!user) throw new UnauthorisedError();
-  return user;
-}
-
 export class ForbiddenError extends Error {}
 
+export class RateLimitedError extends Error {
+  readonly retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number) {
+    super("Too many requests on this API key");
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
 /*
-  The only role check in the product so far, and it guards the only route
-  that destroys data. Everything else is open to any session until phase 6
-  decides the whole permission model at once - one decision for every route
-  rather than a guess per route.
+  Every API route starts here, and nothing in app/api reads a cookie or a
+  header for itself. Cookie first because that is the common case and costs no
+  header read; a bearer key second, which is how CI authenticates.
+
+  The rate limit lives on the key path only: a browser session is a person, and
+  a person cannot loop fast enough to matter. A CI job can, and SQLite
+  serialises writes, so one runaway reporter is an outage for everybody.
 */
-export async function requireRole(...roles: readonly UserRole[]): Promise<SessionUser> {
+export async function requireUser(): Promise<SessionUser> {
+  const session = await currentUser();
+  if (session) return session;
+
+  const keyUser = await apiKeyUser();
+  if (!keyUser?.apiKeyId) throw new UnauthorisedError();
+
+  const decision = takeApiToken(String(keyUser.apiKeyId), nowSeconds());
+  if (!decision.allowed) {
+    throw new RateLimitedError(Math.max(1, decision.resetAt - nowSeconds()));
+  }
+  return keyUser;
+}
+
+/*
+  The permission model, in one sentence: the roles are a ladder and a route
+  names the rung it needs. Three rungs, from AGENTS.md and phase 6:
+
+  - tester  reads everything, records results, uploads attachments.
+  - lead    everything tester can, plus editing the case repository, creating
+            and closing runs, and running an import.
+  - admin   everything lead can, plus the paths that destroy history.
+
+  An API key is checked here exactly like a session, so a key never reaches a
+  route its owner cannot.
+*/
+export async function requireRole(minimum: UserRole): Promise<SessionUser> {
   const user = await requireUser();
-  if (!roles.includes(user.role)) {
-    throw new ForbiddenError(`This needs the ${roles.join(" or ")} role`);
+  if (!roleAtLeast(user.role, minimum)) {
+    throw new ForbiddenError(`This needs the ${minimum} role or better`);
   }
   return user;
 }
@@ -48,8 +80,14 @@ export async function handle(work: () => Promise<Response>): Promise<Response> {
   try {
     return await work();
   } catch (error) {
-    if (error instanceof UnauthorisedError) return problem(401, "Sign in first");
+    if (error instanceof UnauthorisedError) return problem(401, "Sign in, or send an API key");
     if (error instanceof ForbiddenError) return problem(403, error.message);
+    if (error instanceof RateLimitedError) {
+      return Response.json(
+        { error: error.message },
+        { status: 429, headers: { "retry-after": String(error.retryAfterSeconds) } },
+      );
+    }
     if (error instanceof AttachmentTooLargeError) return problem(413, error.message);
     if (error instanceof NotFoundError) return problem(404, error.message);
     if (error instanceof ConflictError) return problem(409, error.message);

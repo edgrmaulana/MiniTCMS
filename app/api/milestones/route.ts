@@ -7,6 +7,7 @@ import {
   optionalText,
   queryId,
   readBody,
+  requireRole,
   requireText,
   requireUser,
 } from "../helpers";
@@ -21,7 +22,7 @@ export async function GET(request: Request): Promise<Response> {
 
 export async function POST(request: Request): Promise<Response> {
   return handle(async () => {
-    await requireUser();
+    await requireRole("lead");
     const body = await readBody(request, [
       "projectId",
       "parentId",

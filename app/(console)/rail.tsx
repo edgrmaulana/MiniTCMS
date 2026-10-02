@@ -3,18 +3,19 @@
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import type { ListResult, ProjectRow } from "@/lib/format";
+import { roleAtLeast, type ListResult, type ProjectRow, type UserRole } from "@/lib/format";
 import { fetchJson } from "../fetch-json";
 import { logout } from "../auth-actions";
 
 // Only the screens that exist get a link; the rest arrive with their phase 5
-// section rather than as a dead entry that 404s.
+// section rather than as a dead entry that 404s. `needs` keeps a link out of
+// the rail when the role behind it would be refused on arrival.
 const DESTINATIONS = [
   { href: "/", label: "Dashboard" },
   { href: "/cases", label: "Cases" },
   { href: "/runs", label: "Runs" },
-  { href: "/migrate", label: "Import" },
-] as const;
+  { href: "/migrate", label: "Import", needs: "admin" },
+] as const satisfies readonly { href: string; label: string; needs?: UserRole }[];
 
 /*
   The selected project lives in the query string and nowhere else, so a link
@@ -22,7 +23,7 @@ const DESTINATIONS = [
   rail link carries it; switching project drops the suite and section with it,
   because those ids belong to the project being left.
 */
-export default function Rail({ email }: { email: string }) {
+export default function Rail({ email, role }: { email: string; role: UserRole }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -79,7 +80,9 @@ export default function Rail({ email }: { email: string }) {
       </div>
 
       <ul className="flex flex-col gap-1">
-        {DESTINATIONS.map((destination) => (
+        {DESTINATIONS.filter(
+          (destination) => !("needs" in destination) || roleAtLeast(role, destination.needs),
+        ).map((destination) => (
           <li key={destination.href}>
             <Link
               href={projectId ? `${destination.href}?projectId=${projectId}` : destination.href}

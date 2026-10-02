@@ -5,7 +5,7 @@ import {
   optionalInteger,
   readBody,
   requireIdList,
-  requireUser,
+  requireRole,
 } from "../../helpers";
 
 /*
@@ -15,7 +15,7 @@ import {
 */
 export async function POST(request: Request): Promise<Response> {
   return handle(async () => {
-    const user = await requireUser();
+    const user = await requireRole("lead");
     const body = await readBody(request, [
       "caseIds",
       "sectionId",

@@ -9,6 +9,7 @@ import {
   optionalText,
   queryId,
   readBody,
+  requireRole,
   requireText,
   requireUser,
 } from "../helpers";
@@ -43,7 +44,7 @@ export async function GET(request: Request): Promise<Response> {
 
 export async function POST(request: Request): Promise<Response> {
   return handle(async () => {
-    const user = await requireUser();
+    const user = await requireRole("lead");
     const body = await readBody(request, WRITABLE);
     if (!Number.isInteger(body.suiteId)) throw new BadRequestError("suiteId is required");
     const id = createCase(getDb(), {

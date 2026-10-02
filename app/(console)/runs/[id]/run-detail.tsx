@@ -8,6 +8,7 @@ import {
   PAGE_SIZES,
   clampPage,
   clampPageSize,
+  roleAtLeast,
   type AssignableUser,
   type ListResult,
   type RunProgress,
@@ -365,9 +366,11 @@ export default function RunDetail({ runId, role }: { runId: number; role: UserRo
             <h1 className="display text-xl">{run.name}</h1>
             {runClosed ? <span className="pill text-muted">Closed</span> : null}
             <div className="ml-auto flex gap-2">
-              <button type="button" className="chip" onClick={toggleClosed}>
-                {runClosed ? "Reopen run" : "Close run"}
-              </button>
+              {roleAtLeast(role, "lead") ? (
+                <button type="button" className="chip" onClick={toggleClosed}>
+                  {runClosed ? "Reopen run" : "Close run"}
+                </button>
+              ) : null}
               {role === "admin" ? (
                 <button type="button" className="chip text-alert" onClick={deleteRun}>
                   Delete run

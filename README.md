@@ -11,8 +11,9 @@ Usable end to end: sign in, import a case CSV from the import screen or a
 whole TestRail instance from the CLI, browse the case tree, edit a case, then
 open a run and record pass, fail, retest or blocked against every test from
 the keyboard. The dashboard says how much of a project has been executed and
-what was recorded last. Creating projects, suites and runs is still an API
-call - those forms are the next cut.
+what was recorded last. A CI job gets an API key and reports results by case
+id in one call. Creating projects, suites and runs is still an API call -
+those forms are the next cut.
 
 | Phase | | |
 |---|---|---|
@@ -21,7 +22,7 @@ call - those forms are the next cut.
 | 3 | Execution — runs, pass/fail/retest/blocked, append-only results | **done** |
 | 4 | TestRail migration — client, CSV reader, mapping, resumable import | **done**, bar attachments |
 | 5 | UI — app shell and the five screens | **done** |
-| 6 | Auth and public API — login, roles, REST API, CI reporters | login done |
+| 6 | Auth and public API — login, roles, REST API, CI reporters | **done**, bar user management |
 | 7 | Release — Docker, CI, license, contributor docs | not started |
 
 Each phase has its own file in [`plan/`](plan/), opening with its status
@@ -39,6 +40,14 @@ npm install
 npm run user:add -- you@example.com admin
 
 npm run dev          # http://localhost:3000/login
+```
+
+```bash
+# A key for CI, printed once. Roles come from the owner, so a key can never
+# do more than the account it belongs to.
+npm run key -- add ci@example.com "github actions"
+npm run key -- list
+npm run key -- revoke 3
 ```
 
 ```bash
@@ -127,15 +136,36 @@ Email and password. No self-service signup: accounts come from
   attempt rows are swept as they are written.
 
 Imported TestRail users land with no password hash and cannot sign in
-until an admin sets one; they exist so results attribute correctly.
+until an admin sets one; they exist so results attribute correctly. A
+deactivated account's API keys stop working the moment the account does.
 What is built and what is not is listed in
 [`plan/06-auth-and-api.md`](plan/06-auth-and-api.md).
 
 ## API
 
-Every route needs a session cookie; an anonymous request gets `401`.
-There are no role checks yet — see
-[`plan/02-case-repository.md`](plan/02-case-repository.md).
+Every route needs a credential, and an anonymous request gets `401` —
+swept by a test that walks every route file on disk, so a route added
+later is covered the day it lands.
+
+Two credentials reach the API: the session cookie a browser holds, and an
+API key a CI job sends as `Authorization: Bearer mtk_...`. They land in
+the same shape, so a key reaches exactly the routes its owner reaches and
+nothing more.
+
+### Roles
+
+Three, and they are a ladder: a route names the rung it needs.
+
+| Role | Can |
+|---|---|
+| `tester` | read everything, record results, upload attachments |
+| `lead` | all of the above, plus editing the case repository and creating, renaming, closing and reopening runs |
+| `admin` | all of the above, plus running an import, defining custom fields, and deleting a run with its results |
+
+A request from too low a rung is a `403` naming the rung it needed. The
+check runs before the body is read, so a refusal never depends on the
+payload being valid. Screens hide the controls a role cannot use; the
+route checks again regardless.
 
 ```text
 GET  POST          /api/projects              ?search=&page=&limit=
@@ -172,7 +202,44 @@ GET                /api/migrate/[id]          state, cursor progress, report
      POST          /api/migrate/csv           multipart/form-data
 ```
 
-The three `/api/migrate` routes need the `admin` or `lead` role. Starting
+### Keys and rate limits
+
+A key is 256 bits of randomness with an `mtk_` prefix, and only its
+SHA-256 hash is stored — minting one prints it once and there is no
+command that can show it again. Revoking is a timestamp, not a delete, so
+a key that ran for six months stays in the audit trail after it stops
+working. `last_used_on` is stamped at most once a minute per key, which
+is enough to find a dead key and few enough writes to stay off the hot
+path.
+
+Key requests are limited to 300 per minute per key; over that is a `429`
+with a `Retry-After`. The window lives in the app process, so two
+processes get an allowance each — see the note in
+[`lib/rate-limit.ts`](lib/rate-limit.ts). A session cookie is never rate
+limited: a person cannot loop fast enough to matter, and a CI job can.
+
+### Reporting from CI
+
+One call, one transaction. `caseId` is accepted in place of `testId`,
+because a test file knows which case it ran, not which test row that
+became inside a run:
+
+```bash
+curl -X POST http://localhost:3000/api/results \
+  -H "Authorization: Bearer $MINITCMS_KEY" \
+  -H "content-type: application/json" \
+  -d '{"runId": 12, "results": [
+        {"caseId": 1041, "statusId": 1, "elapsed": "4s"},
+        {"caseId": 1042, "statusId": 5, "comment": "timeout at step 3"}
+      ]}'
+```
+
+The run id can also be given per entry. A case that is not in that run is
+a `404` naming both ids, never a silently dropped row, and an entry
+carrying both a `testId` and a `caseId` is a `400` rather than a guess.
+Failed and blocked still need a comment, from CI exactly as from a human.
+
+The three `/api/migrate` routes need the `admin` role. Starting
 an API import is deliberately not a route: it is minutes to hours of work
 against a live instance, which is a terminal job, not a request a browser
 holds open. `npm run migrate` is the interface for it, and
@@ -241,7 +308,7 @@ keys say so instead of trying.
 
 ## Data model
 
-Schema version 10: 17 tables, created in one block and guarded by a
+Schema version 11: 18 tables, created in one block and guarded by a
 stamp that is read before anything else is applied.
 
 ```text

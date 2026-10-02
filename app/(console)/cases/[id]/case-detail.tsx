@@ -11,9 +11,11 @@ import {
   CASE_TYPE_LABELS,
   formatTimestamp,
   labelFor,
+  roleAtLeast,
   type CaseFieldRow,
   type CaseRow,
   type SectionTreeRow,
+  type UserRole,
 } from "@/lib/format";
 import { fetchJson } from "../../../fetch-json";
 
@@ -34,7 +36,8 @@ const TEMPLATE_LABELS: Record<number, string> = {
   in the PATCH at all - which is what keeps two people editing two different
   fields from overwriting each other.
 */
-export default function CaseDetail({ caseId }: { caseId: number }) {
+export default function CaseDetail({ caseId, role }: { caseId: number; role: UserRole }) {
+  const mayEdit = roleAtLeast(role, "lead");
   const searchParams = useSearchParams();
   const [caseRow, setCaseRow] = useState<CaseRow | null>(null);
   const [sections, setSections] = useState<SectionTreeRow[]>([]);
@@ -170,9 +173,13 @@ export default function CaseDetail({ caseId }: { caseId: number }) {
         <span className="pill text-violet">{TEMPLATE_LABELS[caseRow.template_id] ?? `Template ${caseRow.template_id}`}</span>
         <div className="ml-auto flex items-center gap-3">
           {saved ? <p className="text-xs text-aurora">Saved</p> : null}
-          <button type="button" className="signin px-4 py-2" disabled={!dirty || busy} onClick={save}>
-            {busy ? "Saving" : "Save"}
-          </button>
+          {mayEdit ? (
+            <button type="button" className="signin px-4 py-2" disabled={!dirty || busy} onClick={save}>
+              {busy ? "Saving" : "Save"}
+            </button>
+          ) : (
+            <p className="text-xs text-muted">Read-only: editing a case needs the lead role</p>
+          )}
         </div>
       </header>
 
@@ -183,185 +190,190 @@ export default function CaseDetail({ caseId }: { caseId: number }) {
       ) : null}
 
       <div className="min-h-0 flex-1 overflow-auto px-6 py-5">
-        <div className="flex max-w-5xl flex-col gap-6">
-          <div className="flex flex-col gap-2">
-            <label htmlFor="title" className="label">
-              Title
-            </label>
-            <input
-              id="title"
-              className="field"
-              value={String(value("title", "title") ?? "")}
-              onChange={(event) => edit("title", event.target.value)}
-            />
-          </div>
-
-          <div className="grid gap-4 md:grid-cols-2">
+        {/* One fieldset instead of a disabled prop on two dozen controls: the
+            browser propagates this to every input inside it, and `contents`
+            keeps it out of the layout. */}
+        <fieldset disabled={!mayEdit} className="contents">
+          <div className="flex max-w-5xl flex-col gap-6">
             <div className="flex flex-col gap-2">
-              <label htmlFor="section" className="label">
-                Section
-              </label>
-              <select
-                id="section"
-                className="field-sm"
-                value={String(value("section_id", "sectionId") ?? "")}
-                onChange={(event) =>
-                  edit("sectionId", event.target.value === "" ? null : Number(event.target.value))
-                }
-              >
-                <option value="">No section</option>
-                {sections.map((section) => (
-                  <option key={section.id} value={section.id}>
-                    {"- ".repeat(section.depth)}
-                    {section.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <IdPicker
-              id="type"
-              label="Type"
-              ids={CASE_TYPE}
-              labels={CASE_TYPE_LABELS}
-              value={value("type_id", "typeId") as number | null}
-              onChange={(next) => edit("typeId", next)}
-            />
-            <IdPicker
-              id="priority"
-              label="Priority"
-              ids={CASE_PRIORITY}
-              labels={CASE_PRIORITY_LABELS}
-              value={value("priority_id", "priorityId") as number | null}
-              onChange={(next) => edit("priorityId", next)}
-            />
-
-            <div className="flex flex-col gap-2">
-              <label htmlFor="refs" className="label">
-                References
+              <label htmlFor="title" className="label">
+                Title
               </label>
               <input
-                id="refs"
-                className="field-sm"
-                value={String(value("refs", "refs") ?? "")}
-                placeholder="BUG-1024"
-                onChange={(event) => edit("refs", event.target.value === "" ? null : event.target.value)}
+                id="title"
+                className="field"
+                value={String(value("title", "title") ?? "")}
+                onChange={(event) => edit("title", event.target.value)}
               />
             </div>
 
-            <div className="flex flex-col gap-2">
-              <label htmlFor="estimate" className="label">
-                Estimate
-              </label>
-              <input
-                id="estimate"
-                className="field-sm"
-                value={String(value("estimate", "estimate") ?? "")}
-                placeholder="1m 45s"
-                onChange={(event) =>
-                  edit("estimate", event.target.value === "" ? null : event.target.value)
-                }
-              />
-            </div>
-          </div>
-
-          <section className="flex flex-col gap-2">
-            <div className="flex flex-wrap items-center gap-3">
-              <p className="label">Steps</p>
-              {stepsEditable ? (
-                <button
-                  type="button"
-                  className="chip"
-                  onClick={() => setSteps([...editedSteps, { content: "", expected: "" }])}
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <label htmlFor="section" className="label">
+                  Section
+                </label>
+                <select
+                  id="section"
+                  className="field-sm"
+                  value={String(value("section_id", "sectionId") ?? "")}
+                  onChange={(event) =>
+                    edit("sectionId", event.target.value === "" ? null : Number(event.target.value))
+                  }
                 >
-                  Add step
-                </button>
-              ) : (
-                <p className="text-xs text-muted">
-                  Read-only: {undefinedKeys.join(", ")} {undefinedKeys.length === 1 ? "has" : "have"} no
-                  field definition, and a save would be refused until {undefinedKeys.length === 1 ? "it does" : "they do"}.
-                </p>
-              )}
-            </div>
-            {editedSteps.length === 0 ? (
-              <p className="text-sm text-muted">This case has no step table.</p>
-            ) : (
-              <table className="grid-table sheet">
-                <thead>
-                  <tr>
-                    <th scope="col" className="w-10">
-                      #
-                    </th>
-                    <th scope="col">Step</th>
-                    <th scope="col">Expected result</th>
-                    <th scope="col" className="w-16" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {editedSteps.map((step, index) => (
-                    <tr key={index}>
-                      <td className="text-muted">{index + 1}</td>
-                      <td>
-                        {stepsEditable ? (
-                          <textarea
-                            className="field-sm w-full"
-                            rows={2}
-                            value={step.content}
-                            aria-label={`Step ${index + 1}`}
-                            onChange={(event) =>
-                              setSteps(replaceStep(editedSteps, index, { content: event.target.value }))
-                            }
-                          />
-                        ) : (
-                          <span className="whitespace-pre-wrap">{step.content}</span>
-                        )}
-                      </td>
-                      <td>
-                        {stepsEditable ? (
-                          <textarea
-                            className="field-sm w-full"
-                            rows={2}
-                            value={step.expected}
-                            aria-label={`Expected result ${index + 1}`}
-                            onChange={(event) =>
-                              setSteps(replaceStep(editedSteps, index, { expected: event.target.value }))
-                            }
-                          />
-                        ) : (
-                          <span className="whitespace-pre-wrap">{step.expected}</span>
-                        )}
-                      </td>
-                      <td>
-                        {stepsEditable ? (
-                          <button
-                            type="button"
-                            className="chip"
-                            onClick={() => setSteps(editedSteps.filter((_, at) => at !== index))}
-                          >
-                            Remove
-                          </button>
-                        ) : null}
-                      </td>
-                    </tr>
+                  <option value="">No section</option>
+                  {sections.map((section) => (
+                    <option key={section.id} value={section.id}>
+                      {"- ".repeat(section.depth)}
+                      {section.name}
+                    </option>
                   ))}
-                </tbody>
-              </table>
-            )}
-          </section>
+                </select>
+              </div>
 
-          <CustomFields custom={custom} definitions={definitions} />
+              <IdPicker
+                id="type"
+                label="Type"
+                ids={CASE_TYPE}
+                labels={CASE_TYPE_LABELS}
+                value={value("type_id", "typeId") as number | null}
+                onChange={(next) => edit("typeId", next)}
+              />
+              <IdPicker
+                id="priority"
+                label="Priority"
+                ids={CASE_PRIORITY}
+                labels={CASE_PRIORITY_LABELS}
+                value={value("priority_id", "priorityId") as number | null}
+                onChange={(next) => edit("priorityId", next)}
+              />
 
-          <dl className="grid gap-2 border-t border-line pt-4 text-xs text-muted md:grid-cols-2">
-            <div>
-              <dt className="label">Created</dt>
-              <dd>{formatTimestamp(caseRow.created_on)}</dd>
+              <div className="flex flex-col gap-2">
+                <label htmlFor="refs" className="label">
+                  References
+                </label>
+                <input
+                  id="refs"
+                  className="field-sm"
+                  value={String(value("refs", "refs") ?? "")}
+                  placeholder="BUG-1024"
+                  onChange={(event) => edit("refs", event.target.value === "" ? null : event.target.value)}
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label htmlFor="estimate" className="label">
+                  Estimate
+                </label>
+                <input
+                  id="estimate"
+                  className="field-sm"
+                  value={String(value("estimate", "estimate") ?? "")}
+                  placeholder="1m 45s"
+                  onChange={(event) =>
+                    edit("estimate", event.target.value === "" ? null : event.target.value)
+                  }
+                />
+              </div>
             </div>
-            <div>
-              <dt className="label">Last updated</dt>
-              <dd>{formatTimestamp(caseRow.updated_on)}</dd>
-            </div>
-          </dl>
-        </div>
+
+            <section className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="label">Steps</p>
+                {stepsEditable ? (
+                  <button
+                    type="button"
+                    className="chip"
+                    onClick={() => setSteps([...editedSteps, { content: "", expected: "" }])}
+                  >
+                    Add step
+                  </button>
+                ) : (
+                  <p className="text-xs text-muted">
+                    Read-only: {undefinedKeys.join(", ")} {undefinedKeys.length === 1 ? "has" : "have"} no
+                    field definition, and a save would be refused until {undefinedKeys.length === 1 ? "it does" : "they do"}.
+                  </p>
+                )}
+              </div>
+              {editedSteps.length === 0 ? (
+                <p className="text-sm text-muted">This case has no step table.</p>
+              ) : (
+                <table className="grid-table sheet">
+                  <thead>
+                    <tr>
+                      <th scope="col" className="w-10">
+                        #
+                      </th>
+                      <th scope="col">Step</th>
+                      <th scope="col">Expected result</th>
+                      <th scope="col" className="w-16" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {editedSteps.map((step, index) => (
+                      <tr key={index}>
+                        <td className="text-muted">{index + 1}</td>
+                        <td>
+                          {stepsEditable ? (
+                            <textarea
+                              className="field-sm w-full"
+                              rows={2}
+                              value={step.content}
+                              aria-label={`Step ${index + 1}`}
+                              onChange={(event) =>
+                                setSteps(replaceStep(editedSteps, index, { content: event.target.value }))
+                              }
+                            />
+                          ) : (
+                            <span className="whitespace-pre-wrap">{step.content}</span>
+                          )}
+                        </td>
+                        <td>
+                          {stepsEditable ? (
+                            <textarea
+                              className="field-sm w-full"
+                              rows={2}
+                              value={step.expected}
+                              aria-label={`Expected result ${index + 1}`}
+                              onChange={(event) =>
+                                setSteps(replaceStep(editedSteps, index, { expected: event.target.value }))
+                              }
+                            />
+                          ) : (
+                            <span className="whitespace-pre-wrap">{step.expected}</span>
+                          )}
+                        </td>
+                        <td>
+                          {stepsEditable ? (
+                            <button
+                              type="button"
+                              className="chip"
+                              onClick={() => setSteps(editedSteps.filter((_, at) => at !== index))}
+                            >
+                              Remove
+                            </button>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+
+            <CustomFields custom={custom} definitions={definitions} />
+
+            <dl className="grid gap-2 border-t border-line pt-4 text-xs text-muted md:grid-cols-2">
+              <div>
+                <dt className="label">Created</dt>
+                <dd>{formatTimestamp(caseRow.created_on)}</dd>
+              </div>
+              <div>
+                <dt className="label">Last updated</dt>
+                <dd>{formatTimestamp(caseRow.updated_on)}</dd>
+              </div>
+            </dl>
+          </div>
+        </fieldset>
       </div>
     </div>
   );

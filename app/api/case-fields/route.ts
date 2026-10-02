@@ -4,6 +4,7 @@ import {
   BadRequestError,
   handle,
   readBody,
+  requireRole,
   requireText,
   requireUser,
 } from "../helpers";
@@ -17,7 +18,7 @@ export async function GET(): Promise<Response> {
 
 export async function POST(request: Request): Promise<Response> {
   return handle(async () => {
-    await requireUser();
+    await requireRole("admin");
     const body = await readBody(request, ["systemName", "label", "type", "isGlobal", "configs"]);
     const type = requireText(body.type, "type");
     // A type the UI cannot render is refused here, where a human typed it.

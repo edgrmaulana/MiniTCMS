@@ -2,15 +2,19 @@ import { cookies, headers } from "next/headers";
 import {
   deleteExpiredSessions,
   deleteSession,
+  findApiKeyUser,
   findSessionUser,
   getDb,
   insertSession,
   nowSeconds,
+  touchApiKey,
 } from "./db.ts";
 import type { SessionUser } from "./format.ts";
 import {
   createSessionToken,
+  hashApiKey,
   hashSessionToken,
+  looksLikeApiKey,
   SESSION_COOKIE,
   SESSION_TTL_SECONDS,
 } from "./auth.ts";
@@ -47,6 +51,28 @@ export async function currentUser(): Promise<SessionUser | null> {
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return null;
   return findSessionUser(getDb(), hashSessionToken(token)) ?? null;
+}
+
+/*
+  The CI path: `Authorization: Bearer mtk_...`. Deliberately separate from
+  currentUser, which stays cookie-only - a page is for a browser, and a bearer
+  token has no business rendering one. The API routes try the cookie first and
+  fall back to here, so a key reaches exactly the routes a session reaches and
+  nothing more.
+*/
+export async function apiKeyUser(): Promise<SessionUser | null> {
+  const header = (await headers()).get("authorization");
+  if (!header) return null;
+  const [scheme, value] = header.split(" ");
+  // Checked before the database is touched: an Authorization header that is
+  // not one of ours should not cost a query, let alone a hash lookup.
+  if (scheme?.toLowerCase() !== "bearer" || !value || !looksLikeApiKey(value)) return null;
+
+  const database = getDb();
+  const user = findApiKeyUser(database, hashApiKey(value));
+  if (!user?.apiKeyId) return null;
+  touchApiKey(database, user.apiKeyId);
+  return user;
 }
 
 export async function endSession(): Promise<void> {

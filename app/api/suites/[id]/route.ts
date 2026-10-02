@@ -4,6 +4,7 @@ import {
   optionalText,
   problem,
   readBody,
+  requireRole,
   requireText,
   requireUser,
   routeId,
@@ -21,7 +22,7 @@ export async function GET(_request: Request, context: Context): Promise<Response
 
 export async function PATCH(request: Request, context: Context): Promise<Response> {
   return handle(async () => {
-    await requireUser();
+    await requireRole("lead");
     const id = routeId((await context.params).id);
     const body = await readBody(request, ["name", "description"]);
     updateSuite(getDb(), id, {

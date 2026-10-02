@@ -129,6 +129,30 @@ export function hashSessionToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
+/*
+  A CI credential. Same construction as a session token - 256 bits of
+  randomBytes, only the SHA-256 hash stored - with a visible prefix so a key
+  that leaks into a log or a repo can be grepped for and recognised as a
+  MiniTCMS secret rather than mistaken for a random string.
+*/
+export const API_KEY_PREFIX = "mtk_";
+
+export function createApiKey(): { key: string; keyHash: string } {
+  const key = API_KEY_PREFIX + randomBytes(32).toString("base64url");
+  return { key, keyHash: hashApiKey(key) };
+}
+
+// Named apart from hashSessionToken even though the construction is identical:
+// the two are looked up in different tables and a future change to one must
+// not silently follow the other.
+export function hashApiKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+export function looksLikeApiKey(value: string): boolean {
+  return value.startsWith(API_KEY_PREFIX) && value.length > API_KEY_PREFIX.length;
+}
+
 export function isValidEmail(email: string): boolean {
   const trimmed = email.trim();
   if (trimmed.length < 3 || trimmed.length > 254) return false;

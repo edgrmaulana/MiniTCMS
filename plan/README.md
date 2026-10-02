@@ -17,7 +17,7 @@ and *when*; AGENTS.md is the *how*.
 | 3 | `03-execution.md` | Runs, test execution, pass/fail/retest/blocked, rollups | done |
 | 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | done, bar attachments |
 | 5 | `05-ui.md` | App shell and the five screens that make it usable | done |
-| 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | partial |
+| 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | done, bar user management |
 | 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | not started |
 
 Each phase file opens with its own status and a per-section breakdown.
@@ -29,8 +29,8 @@ Phase 7 is last.
 
 Phase 6 jumped the queue: the login page was built first, which pulled
 the `users`, `sessions` and `login_attempts` slice of the phase 1 schema
-forward with it. Phase 1 has since landed the rest, and the schema is now at
-version 10.
+forward with it. Phase 1 has since landed the rest, phase 6 added
+`api_keys`, and the schema is now at version 11.
 
 ## Scope
 
@@ -70,6 +70,13 @@ the whole target.
 - **Sessions in the database, not a JWT.** Only the token hash is
   stored, so revocation is a `DELETE` and a leaked database dump does
   not hand over live logins. Details in `06-auth-and-api.md`.
+- **Roles are a ladder, not a set.** tester < lead < admin, ranked in
+  `lib/format.ts`, and a route names the rung it needs. A list of
+  acceptable roles is what somebody forgets to extend, and forgetting it
+  fails open.
+- **API keys are credentials, not identities.** A key's role is read off
+  its owner's row on every request, so it can never outlive or outrank
+  the account that made it.
 - **The visual language is set by the login page**: night-sky palette,
   Archivo for UI, Fraunces for display, all as CSS variables in
   `app/globals.css`. Phase 5 inherits it rather than re-deciding.
