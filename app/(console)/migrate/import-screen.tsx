@@ -153,9 +153,10 @@ export default function ImportScreen() {
     return (
       <section className="mx-auto flex max-w-xl flex-col gap-3 px-8 py-16">
         <p className="label">Import</p>
-        <p className="display text-2xl">This needs the admin or lead role.</p>
+        <p className="display text-2xl">This needs the admin role.</p>
         <p className="text-sm text-muted">
-          An import writes across every project, so it is not open to every session.
+          An import writes across every project and can overwrite migrated rows in all of
+          them, so it is admin work.
         </p>
       </section>
     );

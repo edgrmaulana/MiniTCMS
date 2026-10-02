@@ -10,7 +10,7 @@ export default async function ConsoleLayout({ children }: LayoutProps<"/">) {
 
   return (
     <div className="shell">
-      <Rail email={user.email} />
+      <Rail email={user.email} role={user.role} />
       <main className="min-w-0 rise">{children}</main>
     </div>
   );
