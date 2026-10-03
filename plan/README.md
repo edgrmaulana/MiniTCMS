@@ -17,7 +17,7 @@ and *when*; AGENTS.md is the *how*.
 | 3 | `03-execution.md` | Runs, test execution, pass/fail/retest/blocked, rollups | done |
 | 4 | `04-testrail-migration.md` | TestRail client, CSV reader, field mapping, resumable import | done, bar attachments |
 | 5 | `05-ui.md` | App shell and the five screens that make it usable | done |
-| 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | done, bar user management |
+| 6 | `06-auth-and-api.md` | Login, roles, public REST API, CI reporters | done - accounts are CLI-only, no users screen |
 | 7 | `07-release.md` | Docker, CI, license, contributor docs, v0.1.0 | done, bar the tag |
 
 Each phase file opens with its own status and a per-section breakdown.
@@ -30,7 +30,7 @@ Phase 7 is last.
 Phase 6 jumped the queue: the login page was built first, which pulled
 the `users`, `sessions` and `login_attempts` slice of the phase 1 schema
 forward with it. Phase 1 has since landed the rest, phase 6 added
-`api_keys`, and the schema is now at version 11.
+`api_keys`, and phase 4's section-depth fix took it to version 12.
 
 ## Scope
 
@@ -97,19 +97,27 @@ the whole target.
 
 ## Open questions
 
-- Attachment storage: local disk vs S3-compatible. **Answered in phase
-  3**: local disk behind `saveAttachment`, `ATTACHMENTS_DIR`, one
-  implementation. Still open is the *import* side — phase 4 brings
-  neither the rows nor the bytes across: the bytes are a second API call
-  per attachment and a disk budget nobody has set a number for, and a
-  row pointing at a file that was never fetched is a broken link, so the
-  stage is reported as not built rather than half-done.
-- TestRail "baselines" (`suite_mode` 2): **still open.** Phase 4 carries
-  the `is_baseline` flag over and leaves `baseline_of` NULL with a
-  report line, because `get_suites` does not say which suite a baseline
-  came from. Nobody has run this against a real mode-2 instance.
 - CSV exports from the Steps template, which spread one case over
   several rows: phase 4 refuses them rather than reading half. Needs a
   second real export before it can be built — see `04` section 6.5.
-- BDD/Gherkin case template: TestRail has one, we have no steps parser.
-  Likely stored as text in phase 2, structured later if asked.
+
+## Questions since closed
+
+- TestRail "baselines" (`suite_mode` 2): **resolved - they import flat.**
+  Checked against a real instance with four mode-2 projects, one of them
+  holding seventeen baselines: `get_suites` and `get_suite/:id` return
+  the same nine fields, and none of them names a parent. So
+  `baseline_of` cannot be filled from the API at all, and the import
+  carries `is_baseline` with a report line instead of guessing. The
+  column stays, because a suite created in MiniTCMS can still set it.
+- Attachment import: **resolved, not yet built.** Storage was answered
+  in phase 3 — local disk behind `saveAttachment`, `ATTACHMENTS_DIR`.
+  The import rules are now settled too: 25 MB per file, no cap on the
+  total, and a download that fails is a skip with a report line, never
+  a failed import. A self-hoster sizes their volume from their own
+  TestRail; this project does not guess a number for them. Stage 15 of
+  `04-testrail-migration.md` is the work.
+- BDD/Gherkin case template: **resolved — no parser, ever.** Gherkin
+  imports and stays as text in `custom`, and an author who wants that
+  style types it into the text field themselves. A parser would buy a
+  structure nothing reads.

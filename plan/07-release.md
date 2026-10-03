@@ -55,7 +55,7 @@ A `next build` standalone bundle would cut most of that; it also cannot
 run the CLI, which is why it was not taken. If the size starts to matter,
 the upgrade path is a standalone bundle plus `lib/`, `scripts/` and a
 copied `better-sqlite3` beside it.
-
+  
 Verified against the running container, not just built: `/login` 200,
 `/api/projects` 401 anonymous, `npm run user:add` and `npm run key`
 through `docker compose exec`, a `POST /api/projects` with the minted key
@@ -145,10 +145,10 @@ cuttable: for a team without API access it is the whole product.
 
 **Not tagged.** Auth is on and the image runs clean from the compose
 file - account created, key minted, write accepted, data still there
-after a restart - but
-the gate nobody can wave through is the first one: no API dry run has
-been made against a live TestRail instance, which is also the last open
-item in `plan/04-testrail-migration.md` section 9. `v0.1.0` waits for
-that run and for one real CSV export from somebody else's instance.
-Tagging first would publish an image whose headline feature has never
-touched the system it migrates from.
+after a restart. The first gate is now met: the API dry run has been
+made against a live instance of 62 projects, it reconciled, and the
+three bugs it found are fixed - see
+`plan/04-testrail-migration.md` section 9. One gate is left, the CSV
+one: a real export from an instance that is not the one this project was
+first handed. Tagging before that would publish an image whose second
+entry point has only ever read the sample it was written against.

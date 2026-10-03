@@ -45,6 +45,9 @@ console.log(
     `${resumeFrom ? `, resuming import run ${resumeFrom}` : ""}`,
 );
 
+// Captured before the first fetch, so a failure can name the run to resume.
+let startedRunId;
+
 try {
   const { importRunId, report } = await runApiImport(database, client, {
     projectSourceIds,
@@ -52,13 +55,26 @@ try {
     resumeFrom,
     allowMixedSources: flags.has("allow-mixed-sources"),
     onProgress: (step) => console.log(`  ${step}`),
+    onStart: (startedId) => {
+      startedRunId = startedId;
+    },
   });
   console.log("");
   console.log(formatReport(report));
   console.log(`\nimport run ${importRunId}`);
 } catch (error) {
   console.error(`\nImport failed: ${error.message}`);
-  console.error(`Resume it with: npm run migrate -- --resume <id>`);
+  /*
+    Only when a resume would actually do something. A dry run writes no cursor,
+    and a reconciliation failure happens with every stage already checkpointed,
+    so resuming it would skip everything and report success.
+  */
+  if (!dryRun && startedRunId !== undefined && error.resumable !== false) {
+    console.error(`Resume it with: npm run migrate -- --resume ${startedRunId}`);
+  } else if (error.resumable === false) {
+    console.error("A resume cannot help here: every stage of that run is already");
+    console.error("checkpointed. Fix the cause and run the import again.");
+  }
   process.exit(1);
 }
 

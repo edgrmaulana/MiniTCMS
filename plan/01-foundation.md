@@ -187,7 +187,9 @@ Shared client+server. No DB import.
 - `MAX_SECTION_LEVELS`, named for levels rather than for a maximum depth
   because `depth` is 0-indexed. `depth <= MAX_SECTION_DEPTH` is the
   guard a reader writes by reflex, and it is off by one against the
-  CHECK — hence the name.
+  CHECK — hence the name. It is 64: a runaway bound against a corrupted
+  `parent_id`, not a view on how deep a tree should be. It was 6 until a
+  real export turned up nesting seven deep.
 - `ATTACHMENT_ENTITIES`, interpolated into the `entity_type` CHECK.
 - Shared TS types for every row above. Rows are plain objects; no
   classes.

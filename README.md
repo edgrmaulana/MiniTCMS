@@ -121,9 +121,11 @@ version moves, an older database is refused on open, untouched — delete
 | `TESTRAIL_API_KEY` | — | API key, not a password |
 | `TESTRAIL_RPS` | `5` | Requests per second ceiling for the import |
 
-TestRail credentials go in `.env.local`, never in the repo. The key is
-an API key, which TestRail issues per user under *My Settings → API
-Keys* — not the account password. That is the whole env surface: there is
+TestRail credentials go in `.env.local`, never in the repo, and the CLI
+reads that file itself. The key is an API key, which TestRail issues per
+user under *My Settings → API Keys* — not the account password. An
+admin key imports users as well; a regular one imports everything else
+and reports every author and assignee it had to leave `NULL`. That is the whole env surface: there is
 no signing secret to set, because a session is a random token whose hash
 is what the database holds, so there is nothing for a secret to protect
 and nothing to rotate.
@@ -331,8 +333,11 @@ keys say so instead of trying.
 
 ## Data model
 
-Schema version 11: 18 tables, created in one block and guarded by a
-stamp that is read before anything else is applied.
+Schema version 12: 18 tables, created in one block and guarded by a
+stamp that is read before anything else is applied. Before the first
+release there is no migration path: a database stamped with an older
+version is refused untouched, and the fix is to delete `data.db*` and
+import again.
 
 ```text
 PROJECT holds the truth.

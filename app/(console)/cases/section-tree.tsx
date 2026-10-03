@@ -1,6 +1,6 @@
 "use client";
 
-import type { SectionTreeRow } from "@/lib/format";
+import { treeIndentLevel, type SectionTreeRow } from "@/lib/format";
 
 /*
   The tree arrives from one recursive CTE already in render order, so this
@@ -34,7 +34,7 @@ export default function SectionTree({
           className="tree-row"
           aria-pressed={sectionId === section.id}
           onClick={() => onSelect(section.id)}
-          style={{ paddingLeft: `${0.4 + section.depth * 0.75}rem` }}
+          style={{ paddingLeft: `${0.4 + treeIndentLevel(section.depth) * 0.75}rem` }}
           title={section.description ?? undefined}
         >
           <span className="truncate">{section.name}</span>

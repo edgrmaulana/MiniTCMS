@@ -76,8 +76,9 @@ separate `COUNT(*)` with the same `WHERE`, not `rows.length`.
   `custom_steps_separated` shape exactly so phase 4 is a copy, not a
   transform. Plain-text templates keep `custom.steps_text`.
 - `template_id` decides which fields the UI shows. Templates seeded:
-  1 Text, 2 Steps, 3 Exploratory. BDD deferred — see `README.md` open
-  questions.
+  1 Text, 2 Steps, 3 Exploratory. No BDD template: Gherkin is text in a
+  text field, typed by the author or carried over verbatim by the
+  import, and never parsed.
 - `refs` is a free string, comma-separated. No issue-tracker integration
   in scope; a ref is a link the UI may linkify and nothing more.
 

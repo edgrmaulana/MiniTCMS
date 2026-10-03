@@ -21,6 +21,15 @@ under *Administration → Site Settings → API*. The key inherits the
 permissions of the account it belongs to, so use an account that can read
 every project you intend to move.
 
+An administrator account imports more than a regular one: `get_users` is
+admin-only, and without it no user rows come across, so every author and
+assignee lands `NULL`. The import does not stop for that - it reports the
+`403` and counts how many author and assignee references it had to drop -
+and re-running later with an admin key fills the users in, because the
+import is an upsert. Use an
+admin key if you have one; if you do not, you still get your projects,
+suites, cases, runs and results.
+
 Credentials come from the environment only. Locally that is `.env.local`:
 
 ```bash

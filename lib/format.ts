@@ -122,19 +122,42 @@ export const CASE_TEMPLATE = {
 } as const;
 
 /*
-  Levels, not a maximum depth value: `depth` is 0-indexed, so 6 levels means
-  depths 0 through 5. Named this way because `depth <= MAX_SECTION_DEPTH` is
+  Levels, not a maximum depth value: `depth` is 0-indexed, so 64 levels means
+  depths 0 through 63. Named this way because `depth <= MAX_SECTION_DEPTH` is
   the guard everyone writes by reflex, and with a depth-named constant that
   guard is off by one against the CHECK.
+
+  This is a runaway bound, not a product opinion about how deep a tree should
+  be. It was 6, which a real TestRail export broke on its first outing: that
+  instance nests sections seven deep and 25 of its 1123 cases live down there.
+  Depth costs nothing to read - the tree CTE walks nodes, not levels, so a
+  suite's read is the same work however it is shaped: that instance's 203
+  sections over seven levels read in 369us, and a pathological 64-level chain
+  in 213us, both off idx_sections_suite for the seed and idx_sections_parent
+  for the recursive step. The write paths cannot build a cycle either, because
+  a new section hangs off a parent that already exists and a move refuses a
+  new parent inside the subtree being moved. What is left to protect against
+  is a hand-edited or corrupted `parent_id`, and 64 stops that spinning
+  without ever telling a real migration no.
+
+  The CHECK on `sections.depth` and the `level` bound in every recursive read
+  must stay this same number. A row deeper than the read bound would be
+  invisible in a tree read rather than rejected on the way in, which is the
+  one failure here nobody would see.
 */
-export const MAX_SECTION_LEVELS = 6;
+export const MAX_SECTION_LEVELS = 64;
 
 /*
-  Milestones nest too, and the recursive rollup over them needs the same
-  bound for the same reason: a parent_id cycle would otherwise spin the CTE
-  until the process dies. Not a product limit anybody will hit - a guard.
+  How many levels of indentation a screen draws before it stops stepping in.
+  The tree itself may nest to MAX_SECTION_LEVELS; indenting that far would
+  walk a section name off the side of the panel, so the visual step stops
+  here and deeper rows sit at the same offset as their ancestors.
 */
-export const MAX_MILESTONE_LEVELS = 10;
+export const MAX_TREE_INDENT_LEVELS = 8;
+
+export function treeIndentLevel(depth: number): number {
+  return Math.min(depth, MAX_TREE_INDENT_LEVELS);
+}
 
 // What an attachment can hang off. Interpolated into the CHECK in lib/db.ts.
 export const ATTACHMENT_ENTITIES = ["case", "test", "result"] as const;

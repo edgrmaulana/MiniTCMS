@@ -27,7 +27,7 @@ import {
   upsertStatus,
   upsertUserFromSource,
 } from "../db.ts";
-import type { TestRailClient } from "../testrail.ts";
+import { TestRailError, type TestRailClient } from "../testrail.ts";
 import { CASE_TEMPLATE, RESULT_STATUS, SUITE_MODE, isCaseFieldType } from "../format.ts";
 import {
   type Mapped,
@@ -73,6 +73,9 @@ export type ApiImportOptions = {
   resumeFrom?: number;
   allowMixedSources?: boolean;
   onProgress?: (step: string) => void;
+  /* Called with the import run id before any fetch, so a caller that has to
+     report a failure can name the run to resume instead of a placeholder. */
+  onStart?: (importRunId: number) => void;
 };
 
 /* One statement's worth of rows per transaction, same bound as the bulk
@@ -92,6 +95,7 @@ export async function runApiImport(
 ): Promise<{ importRunId: number; report: ImportReport }> {
   const report = emptyReport(SOURCE_API);
   const { importRunId, done } = openImportRun(database, options);
+  options.onStart?.(importRunId);
 
   const checkpoint = (step: string): void => {
     done.add(step);
@@ -114,8 +118,9 @@ export async function runApiImport(
     deliberate, supervised thing.
   */
   if (options.dryRun) database.exec("BEGIN");
+  let stagesLanded = 0;
   try {
-    await importEverything(database, client, options, report, done, checkpoint);
+    stagesLanded = await importEverything(database, client, options, report, done, checkpoint);
   } catch (error) {
     addError(report, {
       entity: "cases",
@@ -132,13 +137,47 @@ export async function runApiImport(
     addNote(report, "dry run: every row was mapped and written, then rolled back");
   }
 
+  /*
+    A resume whose cursor already names every stage runs nothing at all, and an
+    empty report reconciles perfectly - there is nothing in it to disagree. So
+    the run would flip to done and exit 0 having read not one row, which is the
+    most convincing way to tell an operator a broken import recovered. The
+    cursor is left alone and the state goes back to failed: nothing here has
+    been re-read, so nothing about the run has changed.
+  */
+  if (options.resumeFrom !== undefined && stagesLanded === 0) {
+    updateImportRun(database, importRunId, { state: "failed" });
+    throw Object.assign(
+      new ConflictError(
+        `Import run ${options.resumeFrom} has no stage left to run: its cursor says every ` +
+          `stage already finished, so this resume read nothing. If its report did not ` +
+          `reconcile, run the import again without --resume.`,
+      ),
+      { resumable: false },
+    );
+  }
+
   const complaints = reconcile(report);
   updateImportRun(database, importRunId, {
     state: complaints.length === 0 ? "done" : "failed",
     report: JSON.stringify(report),
   });
   if (complaints.length > 0) {
-    throw new ConflictError(`The import did not reconcile: ${complaints.join("; ")}`);
+    /*
+      Every stage is checkpointed by the time this throws, so resuming this run
+      would skip the lot, reconcile an empty report, and flip the run to done -
+      telling the operator it recovered when nothing was re-read. The flag is
+      how the CLI knows to recommend a fresh run instead.
+
+      TODO: untested. Every count here is derived from the rows that were just
+      written, so making them disagree needs the writer to be wrong - there is
+      no honest fixture for it. The flag and the CLI branch are covered only by
+      reading them. Resuming such a run is refused outright, which is tested.
+    */
+    throw Object.assign(
+      new ConflictError(`The import did not reconcile: ${complaints.join("; ")}`),
+      { resumable: false },
+    );
   }
   return { importRunId, report };
 }
@@ -175,6 +214,16 @@ type Pipeline = {
   priorityIds: Map<number, number>;
   typeIds: Map<number, number>;
   templateIds: Map<number, number>;
+  /* Set when get_users was refused, so the per-row author and assignee drops
+     are counted once instead of listed thousands of times. */
+  usersSkipped: boolean;
+  droppedUserReferences: number;
+  /* Stages that landed, as opposed to ones a cursor said to skip or ones that
+     ran and declined to checkpoint. A resume that lands none of them has
+     changed nothing, whatever it attempted: counting attempts instead would
+     let a refused get_users stand in for progress on an instance where the key
+     is not an admin. */
+  stagesLanded: number;
 };
 
 async function importEverything(
@@ -184,7 +233,7 @@ async function importEverything(
   report: ImportReport,
   done: ReadonlySet<string>,
   checkpoint: (step: string) => void,
-): Promise<void> {
+): Promise<number> {
   /*
     Every id map is rebuilt from the database, not carried over from the
     fetched pages, so a resumed import resolves a parent that a previous
@@ -218,6 +267,9 @@ async function importEverything(
     priorityIds: new Map(),
     typeIds: new Map(),
     templateIds: new Map(),
+    usersSkipped: false,
+    droppedUserReferences: 0,
+    stagesLanded: 0,
   };
 
   await importUsers(pipeline);
@@ -226,11 +278,22 @@ async function importEverything(
   await importLookups(pipeline);
   await importProjects(pipeline);
 
+  if (pipeline.droppedUserReferences > 0) {
+    addNote(
+      report,
+      `${pipeline.droppedUserReferences} author and assignee references were dropped ` +
+        `because no users were imported; they are counted here rather than listed, ` +
+        `so the unmapped section stays useful for everything else`,
+    );
+  }
+
   addNote(
     report,
     "attachments were not fetched: the bytes live behind a second call per row " +
       "and that stage is not built yet (plan section 4, stage 15)",
   );
+
+  return pipeline.stagesLanded;
 }
 
 /*
@@ -243,21 +306,45 @@ async function step(
   pipeline: Pipeline,
   name: string,
   stage: ImportEntity | "lookups",
-  body: () => Promise<void>,
+  /* Returning false means the stage did not land and must not be
+     checkpointed, so a later resume comes back for it. */
+  body: () => Promise<void | false>,
 ): Promise<void> {
   if (pipeline.done.has(name)) return;
   pipeline.options.onProgress?.(name);
   const stop = startTimer(pipeline.report, stage);
-  await body();
+  const landed = await body();
   stop();
+  if (landed === false) return;
+  pipeline.stagesLanded += 1;
   pipeline.checkpoint(name);
 }
 
+/*
+  get_users is administrator-only, and an operator migrating their own
+  project is often not one. A 403 is reported and the import carries on:
+  every author and assignee then resolves to NULL down the same path an
+  unknown id already takes, so the rows land without an identity rather than
+  with a guessed one. The step is deliberately left un-checkpointed, so
+  resuming with an admin key picks the users up.
+*/
 async function importUsers(pipeline: Pipeline): Promise<void> {
   await step(pipeline, "users", "users", async () => {
-    const rows = await pipeline.client.getAll<TestRailRow>("get_users", "users", {
-      limit: PAGE_SIZE,
-    });
+    let rows: TestRailRow[];
+    try {
+      rows = await pipeline.client.getAll<TestRailRow>("get_users", "users", { limit: PAGE_SIZE });
+    } catch (error) {
+      if (!(error instanceof TestRailError) || error.status !== 403) throw error;
+      pipeline.usersSkipped = true;
+      addNote(
+        pipeline.report,
+        "get_users returned 403: this API key is not a TestRail administrator, so no " +
+          "users were imported and every author and assignee is NULL. Re-run with an " +
+          "admin key to fill them in.",
+      );
+      return false;
+    }
+
     const counts = countsFor(pipeline.report, "users");
     counts.fetched += rows.length;
 
@@ -339,10 +426,11 @@ async function importCaseFields(pipeline: Pipeline): Promise<void> {
 }
 
 /*
-  Priorities, case types and templates are not rows we store - they are
-  translation tables. They are re-read on every run, including a resume,
-  because they are three cheap calls and a stale one silently mistranslates
-  every case.
+  Priorities and case types are not rows we store - they are translation
+  tables. They are re-read on every run, including a resume, because they are
+  two cheap calls and a stale one silently mistranslates every case. Templates
+  are the same kind of table but need a project id, so they are read in
+  importTemplates once the project list is known.
 */
 async function importLookups(pipeline: Pipeline): Promise<void> {
   pipeline.options.onProgress?.("lookups");
@@ -355,26 +443,50 @@ async function importLookups(pipeline: Pipeline): Promise<void> {
   const typeMap = labelledIdMap(types, typeFromLabel);
   pipeline.typeIds = typeMap.ids;
 
-  const templates = await pipeline.client.getAll<TestRailRow>("get_templates", "templates");
+  reportUnmatched(pipeline, "priorities", priorityMap.unmatched);
+  reportUnmatched(pipeline, "case types", typeMap.unmatched);
+}
+
+/*
+  Templates are the one translation table TestRail will not serve
+  instance-wide: get_templates answers for a named project and 400s without
+  one. They are read from the first project this import touches, because the
+  template ids are instance-global and the case mapper wants one map, not one
+  per project.
+*/
+async function importTemplates(pipeline: Pipeline, projectSourceId: number): Promise<void> {
+  const templates = await pipeline.client.getAll<TestRailRow>(
+    `get_templates/${projectSourceId}`,
+    "templates",
+  );
   /* Templates decide how a case's step fields are read, so an unknown name
      is reported rather than thrown here: the case mapper falls back to the
      text template and says so per case. */
   const templateMap = labelledIdMap(templates, templateLabelToId);
   pipeline.templateIds = templateMap.ids;
+  reportUnmatched(pipeline, "templates", templateMap.unmatched);
 
-  for (const [entity, unmatched] of [
-    ["priorities", priorityMap.unmatched],
-    ["case types", typeMap.unmatched],
-    ["templates", templateMap.unmatched],
-  ] as const) {
-    for (const row of unmatched) {
-      addUnmapped(pipeline.report, {
-        entity: "cases",
-        sourceId: null,
-        field: entity,
-        value: `"${row.label}" (TestRail id ${row.id}) matches nothing in lib/format.ts`,
-      });
-    }
+  if (templateMap.ids.size === 0) {
+    addNote(
+      pipeline.report,
+      `get_templates/${projectSourceId} matched no template this build knows, so every ` +
+        `case falls back to the text template; its step fields are reported per case`,
+    );
+  }
+}
+
+function reportUnmatched(
+  pipeline: Pipeline,
+  field: string,
+  unmatched: readonly { id: number; label: string }[],
+): void {
+  for (const row of unmatched) {
+    addUnmapped(pipeline.report, {
+      entity: "cases",
+      sourceId: null,
+      field,
+      value: `"${row.label}" (TestRail id ${row.id}) matches nothing in lib/format.ts`,
+    });
   }
 }
 
@@ -402,6 +514,9 @@ async function importProjects(pipeline: Pipeline): Promise<void> {
     );
   }
 
+  if (wanted.length === 0) return;
+  await importTemplates(pipeline, wanted[0].id);
+
   /*
     Counted inside the step, not out here: a resume skips the step, and a
     row counted as fetched with nothing written against it fails
@@ -413,7 +528,7 @@ async function importProjects(pipeline: Pipeline): Promise<void> {
     await step(pipeline, `project:${project.id}`, "projects", async () => {
       counts.fetched += 1;
       const mapped = mapProject(project, SOURCE_API);
-      recordUnmapped(pipeline.report, "projects", project.id, mapped.unmapped);
+      recordUnmapped(pipeline, "projects", project.id, mapped.unmapped);
       const outcome = write(pipeline.database, "projects", mapped.row);
       pipeline.ids.projects.set(project.id, outcome.id);
       tally(counts, outcome.action);
@@ -444,7 +559,7 @@ async function importProjectBody(
     counts.fetched += suites.length;
     writeBatched(pipeline.database, suites, (suite) => {
       const mapped = mapSuite(suite, projectId, SOURCE_API);
-      recordUnmapped(pipeline.report, "suites", suite.id, mapped.unmapped);
+      recordUnmapped(pipeline, "suites", suite.id, mapped.unmapped);
       const outcome = write(pipeline.database, "suites", mapped.row);
       pipeline.ids.suites.set(suite.id, outcome.id);
       tally(counts, outcome.action);
@@ -550,7 +665,7 @@ async function importSuiteBody(
         typeIds: pipeline.typeIds,
         templateIds: pipeline.templateIds,
       });
-      recordUnmapped(pipeline.report, "cases", testrailCase.id, mapped.unmapped);
+      recordUnmapped(pipeline, "cases", testrailCase.id, mapped.unmapped);
       if (mapped.row.updated_on === null) {
         mapped.row.updated_on =
           existingCaseUpdatedOn(pipeline.database, SOURCE_API, testrailCase.id) ??
@@ -580,7 +695,7 @@ async function importPlans(
         milestoneIds: pipeline.ids.milestones,
         source: SOURCE_API,
       });
-      recordUnmapped(pipeline.report, "plans", plan.id, mapped.unmapped);
+      recordUnmapped(pipeline, "plans", plan.id, mapped.unmapped);
       const outcome = write(pipeline.database, "plans", mapped.row);
       pipeline.ids.plans.set(plan.id, outcome.id);
       tally(counts, outcome.action);
@@ -630,7 +745,7 @@ async function importRuns(
         milestoneIds: pipeline.ids.milestones,
         source: SOURCE_API,
       });
-      recordUnmapped(pipeline.report, "runs", run.id, mapped.unmapped);
+      recordUnmapped(pipeline, "runs", run.id, mapped.unmapped);
       const outcome = write(pipeline.database, "runs", mapped.row);
       pipeline.ids.runs.set(run.id, outcome.id);
       tally(counts, outcome.action);
@@ -663,7 +778,7 @@ async function importRunBody(
         knownStatusIds: pipeline.statusIds,
         source: SOURCE_API,
       });
-      recordUnmapped(pipeline.report, "tests", test.id, mapped.unmapped);
+      recordUnmapped(pipeline, "tests", test.id, mapped.unmapped);
       const outcome = write(pipeline.database, "tests", mapped.row);
       pipeline.ids.tests.set(test.id, outcome.id);
       tally(counts, outcome.action);
@@ -685,7 +800,7 @@ async function importRunBody(
         knownStatusIds: pipeline.statusIds,
         source: SOURCE_API,
       });
-      recordUnmapped(pipeline.report, "results", result.id, mapped.unmapped);
+      recordUnmapped(pipeline, "results", result.id, mapped.unmapped);
       const outcome = write(pipeline.database, "results", mapped.row);
       pipeline.ids.results.set(result.id, outcome.id);
       tally(counts, outcome.action);
@@ -726,7 +841,7 @@ function writeNested(
     }
     writeBatched(pipeline.database, ready, (row) => {
       const mapped = map(row);
-      recordUnmapped(pipeline.report, table as ImportEntity, row.id, mapped.unmapped);
+      recordUnmapped(pipeline, table as ImportEntity, row.id, mapped.unmapped);
       const outcome = write(pipeline.database, table, mapped.row);
       ids.set(row.id, outcome.id);
       tally(counts, outcome.action);
@@ -756,14 +871,23 @@ function writeBatched<Row>(
   }
 }
 
+/* The fields `reference()` fills from the users map. With no users imported
+   every row drops two or three of them, which would spend the whole report
+   budget restating one fact. */
+const USER_REFERENCE_FIELDS = new Set(["created_by", "updated_by", "assignedto_id"]);
+
 function recordUnmapped(
-  report: ImportReport,
+  pipeline: Pipeline,
   entity: ImportEntity,
   sourceId: number,
   entries: readonly UnmappedField[],
 ): void {
   for (const entry of entries) {
-    addUnmapped(report, { entity, sourceId, field: entry.field, value: entry.value });
+    if (pipeline.usersSkipped && USER_REFERENCE_FIELDS.has(entry.field)) {
+      pipeline.droppedUserReferences += 1;
+      continue;
+    }
+    addUnmapped(pipeline.report, { entity, sourceId, field: entry.field, value: entry.value });
   }
 }
 

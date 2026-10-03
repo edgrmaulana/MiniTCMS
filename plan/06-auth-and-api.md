@@ -5,7 +5,9 @@ results.
 
 **Status: done.** Sign-in shipped ahead of its phase; roles, keys and the
 CI path landed together, because a role model decided one route at a time
-is a role model with holes in it.
+is a role model with holes in it. Accounts are created by
+`scripts/create-user.mjs`; `/api/users` reads the list for assignee
+pickers and nothing writes a user over HTTP.
 
 | Section | State |
 |---------|-------|

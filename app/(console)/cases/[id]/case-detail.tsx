@@ -16,6 +16,7 @@ import {
   type CaseRow,
   type SectionTreeRow,
   type UserRole,
+  treeIndentLevel,
 } from "@/lib/format";
 import { fetchJson } from "../../../fetch-json";
 
@@ -223,7 +224,7 @@ export default function CaseDetail({ caseId, role }: { caseId: number; role: Use
                   <option value="">No section</option>
                   {sections.map((section) => (
                     <option key={section.id} value={section.id}>
-                      {"- ".repeat(section.depth)}
+                      {"- ".repeat(treeIndentLevel(section.depth))}
                       {section.name}
                     </option>
                   ))}

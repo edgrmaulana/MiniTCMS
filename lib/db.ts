@@ -3,7 +3,6 @@ import {
   ATTACHMENT_ENTITIES,
   BUILT_IN_STATUSES,
   CaseFieldError,
-  MAX_MILESTONE_LEVELS,
   MAX_SECTION_LEVELS,
   RESULT_STATUS,
   SUITE_MODE,
@@ -44,7 +43,7 @@ import {
   type UserRow,
 } from "./format.ts";
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 // Interpolated at module load from constants, never from a request value.
 const quoted = (values: readonly string[]) => values.map((value) => `'${value}'`).join(", ");
@@ -2421,8 +2420,23 @@ export function planSummary(database: Database.Database, planId: number): Status
 
 /*
   Milestones nest, so this rolls up the whole branch: the milestone's own runs
-  plus every descendant milestone's. One recursive CTE, same level bound as
-  the section tree for the same reason.
+  plus every descendant milestone's.
+
+  The walk is bounded by the ids it has already visited rather than by a level
+  count. A level bound was wrong here in a way it is not wrong for sections:
+  sections carry a stored `depth` with a CHECK, so nothing can be written
+  deeper than a read will walk, while milestones have no depth column and the
+  importer writes them straight through `importWriter`. A bound of ten
+  therefore silently stopped counting at the eleventh level - a 14-deep chain
+  returned an empty rollup at the root while the tests sat at the bottom, with
+  no error anywhere. Visiting each id once terminates on a corrupted
+  `parent_id` cycle too, which is all the bound was ever protecting against.
+
+  Measured on 2000 milestones shaped as a 40-deep spine with 49 siblings at
+  each level, 40 runs and 2000 tests: the root rolls up in 1.8ms off
+  idx_runs_milestone, idx_milestones_parent and idx_tests_run, all covering.
+  The GROUP BY takes a temp b-tree, which is fine here and not the paged-list
+  case that rule warns about - it groups one row per status, not per test.
 */
 export function milestoneSummary(
   database: Database.Database,
@@ -2431,12 +2445,12 @@ export function milestoneSummary(
   return database
     .prepare(
       `WITH RECURSIVE branch AS (
-         SELECT id, 0 AS level FROM milestones WHERE id = ?
+         SELECT id, '/' || id || '/' AS seen FROM milestones WHERE id = ?
           UNION ALL
-         SELECT child.id, branch.level + 1
+         SELECT child.id, branch.seen || child.id || '/'
            FROM milestones child
            JOIN branch ON child.parent_id = branch.id
-          WHERE branch.level + 1 < ?
+          WHERE instr(branch.seen, '/' || child.id || '/') = 0
        )
        SELECT tests.status_id, COUNT(*) AS total
          FROM tests
@@ -2444,7 +2458,7 @@ export function milestoneSummary(
         WHERE runs.milestone_id IN (SELECT id FROM branch)
         GROUP BY tests.status_id`,
     )
-    .all(milestoneId, MAX_MILESTONE_LEVELS) as StatusCount[];
+    .all(milestoneId) as StatusCount[];
 }
 
 export function insertAttachment(

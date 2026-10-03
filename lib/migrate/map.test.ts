@@ -20,7 +20,13 @@ import {
   templateFromLabel,
   typeFromLabel,
 } from "./map";
-import { CASE_PRIORITY, CASE_TEMPLATE, CASE_TYPE, RESULT_STATUS } from "../format";
+import {
+  CASE_PRIORITY,
+  CASE_TEMPLATE,
+  CASE_TYPE,
+  MAX_SECTION_LEVELS,
+  RESULT_STATUS,
+} from "../format";
 
 describe("source ids", () => {
   it("strips one entity letter", () => {
@@ -76,8 +82,21 @@ describe("section paths", () => {
   });
 
   it("rejects a path deeper than the schema allows", () => {
-    const deep = ["a", "b", "c", "d", "e", "f", "g"];
-    expect(() => assertSectionPath(deep, { depth: 6, leaf: "g" }, "C9")).toThrow(/levels deep/);
+    // Built from the constant, so raising the cap moves the test with it
+    // instead of leaving a hardcoded depth that no longer proves anything.
+    const deep = Array.from({ length: MAX_SECTION_LEVELS + 1 }, (_, index) => `s${index}`);
+    const leaf = deep[deep.length - 1];
+    expect(() =>
+      assertSectionPath(deep, { depth: MAX_SECTION_LEVELS, leaf }, "C9"),
+    ).toThrow(/levels deep/);
+  });
+
+  it("accepts a path at exactly the cap", () => {
+    const atCap = Array.from({ length: MAX_SECTION_LEVELS }, (_, index) => `s${index}`);
+    const leaf = atCap[atCap.length - 1];
+    expect(() =>
+      assertSectionPath(atCap, { depth: MAX_SECTION_LEVELS - 1, leaf }, "C9"),
+    ).not.toThrow();
   });
 });
 
@@ -187,8 +206,20 @@ describe("api mappers", () => {
 
   it("rejects a section deeper than the schema allows", () => {
     expect(() =>
-      mapSection({ id: 9, name: "Deep", depth: 6 }, { suiteId: 1, sectionIds: empty, source: "testrail" }),
-    ).toThrow(/depth 6/);
+      mapSection(
+        { id: 9, name: "Deep", depth: MAX_SECTION_LEVELS },
+        { suiteId: 1, sectionIds: empty, source: "testrail" },
+      ),
+    ).toThrow(new RegExp(`depth ${MAX_SECTION_LEVELS}`));
+  });
+
+  it("accepts a section one level inside the cap", () => {
+    expect(() =>
+      mapSection(
+        { id: 9, name: "Deepest allowed", depth: MAX_SECTION_LEVELS - 1, parent_id: null },
+        { suiteId: 1, sectionIds: empty, source: "testrail" },
+      ),
+    ).not.toThrow();
   });
 
   it("reports a parent that was never imported instead of writing a dangling id", () => {
