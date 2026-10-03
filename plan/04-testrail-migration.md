@@ -62,15 +62,29 @@ column an instance has that nobody anticipated.
 Three things are deliberately not built, each reported by every import
 that touches them rather than left silent:
 
-- **Attachments.** Neither the rows nor the files come across on the API
-  path: the bytes are a second call per attachment and a disk budget
-  nobody has set a number for, and an attachment row whose file was
-  never fetched is a broken link in the UI. Stage 15 below is the
-  unbuilt stage, and every import carries a note saying so. The CSV path
-  reports each non-empty `Attachments` cell as a skip with the case id.
+- **Attachments.** Neither the rows nor the files come across yet: the
+  bytes are a second call per attachment, and an attachment row whose
+  file was never fetched is a broken link in the UI. Stage 15 below is
+  the unbuilt stage, and every import carries a note saying so. Its
+  rules are now settled: 25 MB per file, no cap on the total, and a
+  download that fails is a skip with a report line rather than a failed
+  import. The CSV path reports each non-empty `Attachments` cell as a
+  skip with the case id.
+- **A non-administrator key.** `get_users` is admin-only on TestRail and
+  an operator migrating their own project is often not one. A `403` there
+  is a reported note, not a failure: the import goes on and every author
+  and assignee resolves to NULL down the same path an unknown id already
+  takes, counted once in a note rather than listed per row - with no users
+  at all that is two or three lines per case, which would spend the whole
+  1000-entry report budget restating one fact and crowd out the unmapped
+  fields worth reading. The stage is left un-checkpointed, so resuming with
+  an admin key fills the users in. Any other status from `get_users` still
+  fails loud.
 - **`suite_mode` 2 baselines.** `is_baseline` carries over and
-  `baseline_of` stays NULL, because `get_suites` does not say which
-  suite a baseline came from.
+  `baseline_of` stays NULL, because neither `get_suites` nor
+  `get_suite/:id` names the suite a baseline came from - both answer
+  with the same nine fields, confirmed against an instance with four
+  mode-2 projects and seventeen baselines in one of them.
 - **Imported roles.** TestRail's role ids are instance-specific and its
   permission model is not ours, so every imported account lands on
   `tester` and the report says so. Least privilege beats a guess that
@@ -135,12 +149,21 @@ checkpoints after each stage.
      per run:
 13     get_tests                  -> tests
 14     get_results_for_run        -> results
-15 attachments for cases/tests/results -> attachments
+15 attachments for cases/tests/results -> attachments   (not built)
 ```
 
 Sections and milestones both nest: sort by `parent_id IS NULL` first,
 then insert iteratively until no row is left — a parent is always
 written before its children or the FK rejects it.
+
+Stage 15 is specified but unbuilt. When it is written: the row and its
+bytes land together or neither does, so a link in the UI is never dead.
+A file over 25 MB is not fetched at all, and a fetch that fails for any
+other reason is caught — both leave a `report.skipped` line naming the
+source id and the reason, and neither stops the import. There is no
+ceiling on the total an import may write: the per-file limit is the
+only budget, so a self-hoster sizes the volume from their own TestRail,
+not from a number this project guessed.
 
 ## 3. Mapping — `lib/migrate/map.ts`
 
@@ -392,7 +415,9 @@ traps the real export has, in `lib/migrate/csv.test.ts`:
   first; a second pass over the same file adds none.
 - A row whose depth disagrees with its segment count fails loud and
   names the case id.
-- A path 7 levels deep is rejected against `MAX_SECTION_LEVELS`.
+- A path one level past `MAX_SECTION_LEVELS` is rejected, and a path at
+  exactly the cap is accepted. Both are built from the constant, so raising
+  it moves the tests rather than stranding them.
 - An unknown `Priority` label imports the case with NULL and one
   `report.unmapped` line — it does not become `other`.
 - A missing `--tz` refuses the import.
@@ -412,3 +437,61 @@ against a live instance and one against a real CSV export before
 calling the phase done — fixtures do not catch a wrong URL shape, and
 they do not catch a column the exporting user ticked that nobody
 anticipated.
+
+**A second real CSV export has now been read too**, 1123 cases from the
+same instance, and it broke something the 243-case sample never reached:
+its sections nest seven levels deep, and `MAX_SECTION_LEVELS` was 6. One
+too-deep section aborted all 1123 cases. The cap was a runaway bound
+wearing a product limit's clothes - see the comment on the constant - so
+it is now 64, schema v12, and the tests that asserted a seven-level path
+is rejected now build their path from the constant instead. Two more
+facts that file carried and no fixture had: one cell held 157,700
+characters, and `Steps` appears twice in the header, where the reader
+takes the first as `steps_text` and reports the second as
+`steps_text_2`. With the cap raised the file imports whole - 1123 cases,
+203 sections, 15 custom fields - and a second run reports every row
+unchanged.
+
+Two things the resume path got wrong, both found reviewing the above and
+both now refused rather than reported as success:
+
+- A run whose cursor already names every stage ran nothing on resume, and
+  an empty report reconciles perfectly because there is nothing in it to
+  disagree - so the run flipped to `done` and exited 0 having read not one
+  row. That is the shape a reconciliation failure leaves behind, so the
+  one case where an operator is most likely to reach for `--resume` was
+  the case that lied to them. A resume that runs no stage is now refused,
+  the state stays `failed`, and the CLI says to re-run instead.
+- The failure hint named a run id for every throw, including that one.
+
+**The API dry run has now been made**, against an instance of 62
+projects with a non-administrator key, and it earned its place three
+times over. What only a live instance could say:
+
+- `get_templates` takes the project in its path and answers `400` without
+  one. The pipeline called it bare, so stage 4 had never once succeeded -
+  and the fixture used the bare name too, which is why 317 green tests
+  said nothing. Templates are now read from the first project an import
+  touches.
+- `get_users` is administrator-only. It is stage 1, so a non-admin key
+  failed the whole import before it read a row. A `403` is now a reported
+  note and the import continues; see the bullet in section 3.
+- `npm run migrate` never loaded `.env.local`, which is the one place
+  `README.md` and the script's own error message both tell an operator to
+  put their credentials. The CLI scripts now pass
+  `--env-file-if-exists=.env.local`.
+
+What the run confirmed rather than changed: the `?/api/v2/` URL shape,
+Basic auth, and the `_links.next` paging - `next` arrives as a path, not
+a URL, and `getAll` already slotted it in correctly. Read at `limit=2`,
+a nine-case suite came back as nine rows over five pages with no
+duplicate and nothing dropped. A one-project dry run reconciled with
+every count accounted for.
+
+Two things a real instance shows that no fixture had: case types are
+renamed per instance (`Feature Testing`, `Smoke & Sanity` at ids 11 and
+13 here, matching nothing in `lib/format.ts`), and three of 23 custom
+fields use type ids we have no mapping for. Both are reported and
+preserved verbatim, which is the designed answer, but it means an
+unmapped-type report line is the normal case on a real migration, not an
+exception.
