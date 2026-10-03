@@ -59,3 +59,6 @@ data.db-shm
 # Vendored agent skills (third-party, decide before publishing)
 .agents/
 skills-lock.json
+
+# Local MCP server config - holds live credentials, never commit
+.mcp.json
