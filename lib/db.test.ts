@@ -1089,6 +1089,49 @@ describe("execution", () => {
     expect(milestoneSummary(database, parent).map((row) => row.total).reduce((a, b) => a + b)).toBe(2);
   });
 
+  /*
+    The rollup used to stop at ten levels, so a deeper chain reported an empty
+    branch at the root while the tests sat at the bottom - wrong, and silent.
+  */
+  it("rolls up a milestone chain far deeper than any level bound", () => {
+    const projectId = createProject(database, { name: "Deep" });
+    const suiteId = createSuite(database, { projectId, name: "S" });
+    const caseId = createCase(database, { suiteId, title: "only case" });
+
+    let parentId: number | null = null;
+    const chain: number[] = [];
+    for (let level = 0; level < 40; level += 1) {
+      parentId = createMilestone(database, { projectId, parentId, name: `level ${level}` });
+      chain.push(parentId);
+    }
+
+    const runId = createRun(database, {
+      projectId,
+      suiteId,
+      name: "deep run",
+      milestoneId: chain[chain.length - 1],
+      caseIds: [caseId],
+    });
+    addResult(database, { testId: testIdsOf(runId)[0], statusId: RESULT_STATUS.passed });
+
+    // Every ancestor sees it, not just the ones within some arbitrary bound.
+    for (const milestoneId of chain) {
+      expect(milestoneSummary(database, milestoneId)).toEqual([
+        { status_id: RESULT_STATUS.passed, total: 1 },
+      ]);
+    }
+  });
+
+  it("does not spin forever on a parent_id cycle", () => {
+    const projectId = createProject(database, { name: "Cycle" });
+    const first = createMilestone(database, { projectId, name: "one" });
+    const second = createMilestone(database, { projectId, parentId: first, name: "two" });
+    // Only a corrupted database reaches this shape; the walk still has to end.
+    database.prepare("UPDATE milestones SET parent_id = ? WHERE id = ?").run(second, first);
+
+    expect(milestoneSummary(database, first)).toEqual([]);
+  });
+
   it("assigns without locking: anyone may record on an assigned test", () => {
     const { runId } = seedRun(2);
     const ids = testIdsOf(runId);

@@ -19,6 +19,7 @@ import {
   type SectionTreeRow,
   type SuiteRow,
   type UserRole,
+  treeIndentLevel,
 } from "@/lib/format";
 import { selectRange, toggleAll, toggleSelected } from "@/lib/selection";
 import { fetchJson, postJson } from "../../fetch-json";
@@ -326,7 +327,7 @@ export default function CasesScreen({ role }: { role: UserRole }) {
                   disabled={busy}
                   options={sections.map((section) => ({
                     value: section.id,
-                    label: `${"- ".repeat(section.depth)}${section.name}`,
+                    label: `${"- ".repeat(treeIndentLevel(section.depth))}${section.name}`,
                   }))}
                   onPick={(value) => applyToSelection({ sectionId: value })}
                 />

@@ -19,7 +19,7 @@ import { parseCsv, readCsvCases } from "./csv";
 import { importCsv, runCsvImport } from "./import-csv";
 import { MappingError, parseUserMap } from "./map";
 import { type ImportReport, emptyReport, reconcile } from "./report";
-import { CASE_PRIORITY, CASE_TYPE } from "../format";
+import { CASE_PRIORITY, CASE_TYPE, MAX_SECTION_LEVELS } from "../format";
 
 /*
   The fixture is written by hand from the format facts measured on a real
@@ -194,9 +194,12 @@ describe("readCsvCases", () => {
       {
         ID: "C105",
         Title: "Too deep",
-        Section: "g",
-        "Section Depth": "6",
-        "Section Hierarchy": "a > b > c > d > e > f > g",
+        Section: `s${MAX_SECTION_LEVELS}`,
+        "Section Depth": String(MAX_SECTION_LEVELS),
+        "Section Hierarchy": Array.from(
+          { length: MAX_SECTION_LEVELS + 1 },
+          (_, index) => `s${index}`,
+        ).join(" > "),
       },
     ]);
     expect(() => readCsvCases(file, OPTIONS, emptyReport("x"))).toThrow(/levels deep/);
