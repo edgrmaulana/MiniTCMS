@@ -460,9 +460,10 @@ function nowSecondsForImport(): number {
 
 /*
   TestRail suite_mode 2 is "single suite plus baselines". The baseline flag
-  carries over; which suite a baseline was taken from is not in get_suites,
-  so `baseline_of` stays NULL and the row is reported. Nobody has confirmed
-  this against a real mode-2 instance yet - see plan section 3.
+  carries over; which suite a baseline was taken from is in neither
+  get_suites nor get_suite/:id - both answer with the same nine fields - so
+  `baseline_of` stays NULL and the row is reported. Confirmed against an
+  instance with four mode-2 projects; see plan section 3.
 */
 export function mapSuite(suite: TestRailRow, projectId: number, source: string): Mapped {
   const name = text(suite.name);

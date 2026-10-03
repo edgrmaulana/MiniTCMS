@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import {
   createCase,
+  createImportRun,
   createProject,
   createSuite,
   getImportRun,
@@ -15,8 +16,9 @@ import {
   openDb,
   runSummary,
   sectionTree,
+  updateImportRun,
 } from "../db";
-import type { TestRailClient } from "../testrail";
+import { TestRailError, type TestRailClient } from "../testrail";
 import { runApiImport } from "./run";
 import { reconcile } from "./report";
 import { CASE_PRIORITY, CASE_TEMPLATE, CASE_TYPE, RESULT_STATUS } from "../format";
@@ -66,9 +68,12 @@ function instance(): Record<string, unknown> {
       { id: 7, name: "Other" },
       { id: 3, name: "Smoke & Sanity" },
     ],
-    get_templates: [
+    /* Keyed by project: get_templates takes the project in the path and 400s
+       without one, so a fixture under the bare name would hide that. */
+    "get_templates/10": [
       { id: 1, name: "Test Case (Text)" },
       { id: 2, name: "Test Case (Steps)" },
+      { id: 5, name: "Behaviour Driven Development" },
     ],
     get_projects: [
       { id: 10, name: "Payments", announcement: "read me", suite_mode: 1, is_completed: false },
@@ -185,6 +190,11 @@ function fakeClient(data: Record<string, unknown>): Fake {
       query?: Record<string, string | number>,
     ) {
       const body = answer(method, query);
+      /* Throws rather than answering an empty list, like `get` does. A
+         missing fixture used to read as "that collection is empty", which is
+         how a call to the bare `get_templates` - a 400 against the real API -
+         sat behind green tests. */
+      if (body === undefined) throw new Error(`no fixture for ${method}`);
       return (Array.isArray(body) ? body : []) as Row[];
     },
   };
@@ -385,6 +395,113 @@ describe("api import", () => {
     expect(database.prepare("SELECT COUNT(*) AS total FROM projects").get()).toEqual({ total: 1 });
   });
 
+  it("reads templates per project, because TestRail serves them no other way", async () => {
+    const { client, calls } = fakeClient(instance());
+    const { report } = await runApiImport(database, client);
+
+    expect(calls).toContain("get_templates/10");
+    expect(calls).not.toContain("get_templates");
+    // BDD has no steps parser here, so the name is reported and the case
+    // mapper falls back to the text template.
+    expect(report.unmapped).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "templates", value: expect.stringContaining("Behaviour") }),
+      ]),
+    );
+  });
+
+  it("carries on without users when the key is not an administrator", async () => {
+    const { client } = fakeClient(instance());
+    const original = client.getAll;
+    client.getAll = (async (method: string, collection: string, params?: unknown) => {
+      if (method === "get_users") {
+        throw new TestRailError("get_users page 1 failed: 403 Access Denied", 403);
+      }
+      return original.call(client, method, collection, params as never);
+    }) as TestRailClient["getAll"];
+
+    const { report } = await runApiImport(database, client);
+
+    expect(reconcile(report)).toEqual([]);
+    expect(database.prepare("SELECT COUNT(*) AS total FROM users").get()).toEqual({ total: 0 });
+    expect(report.notes.some((note) => note.includes("not a TestRail administrator"))).toBe(true);
+    // The rows still land; what they lose is the identity.
+    expect(database.prepare("SELECT COUNT(*) AS total FROM cases").get()).toEqual({ total: 2 });
+    expect(
+      database.prepare("SELECT COUNT(*) AS total FROM cases WHERE created_by IS NOT NULL").get(),
+    ).toEqual({ total: 0 });
+
+    /* Counted in one note, not listed per row: two cases, two tests and a
+       result would otherwise spend the report budget saying the same thing,
+       and on a real instance it is exhausted before the second project. */
+    expect(report.unmapped.filter((entry) => entry.field === "created_by")).toEqual([]);
+    expect(report.unmapped.filter((entry) => entry.field === "assignedto_id")).toEqual([]);
+    const dropped = report.notes.find((note) => note.includes("references were dropped"));
+    expect(dropped).toMatch(/^\d+ author and assignee references were dropped/);
+  });
+
+  it("keeps listing the unmapped fields that are not about users", async () => {
+    const { client } = fakeClient(instance());
+    const original = client.getAll;
+    client.getAll = (async (method: string, collection: string, params?: unknown) => {
+      if (method === "get_users") {
+        throw new TestRailError("get_users page 1 failed: 403 Access Denied", 403);
+      }
+      return original.call(client, method, collection, params as never);
+    }) as TestRailClient["getAll"];
+
+    const { report } = await runApiImport(database, client);
+
+    // The baseline_of and custom-field lines still have to come through.
+    expect(report.unmapped.some((entry) => entry.entity === "case_fields")).toBe(true);
+  });
+
+  it("leaves the users stage open so a resume with an admin key fills it", async () => {
+    /* A 403 on users and then a failure further down: the resume has to come
+       back for the users the first attempt was not allowed to read, which it
+       only does if that stage was never checkpointed. */
+    const forbidden = fakeClient(instance());
+    const original = forbidden.client.getAll;
+    forbidden.client.getAll = (async (method: string, collection: string, params?: unknown) => {
+      if (method === "get_users") {
+        throw new TestRailError("get_users page 1 failed: 403 Access Denied", 403);
+      }
+      if (method === "get_cases/10") throw new Error("connection reset");
+      return original.call(forbidden.client, method, collection, params as never);
+    }) as TestRailClient["getAll"];
+    await expect(runApiImport(database, forbidden.client)).rejects.toThrow("connection reset");
+    expect(database.prepare("SELECT COUNT(*) AS total FROM users").get()).toEqual({ total: 0 });
+
+    const promoted = fakeClient(instance());
+    const { report } = await runApiImport(database, promoted.client, { resumeFrom: 1 });
+
+    expect(promoted.calls).toContain("get_users");
+    expect(database.prepare("SELECT COUNT(*) AS total FROM users").get()).toEqual({ total: 2 });
+    expect(reconcile(report)).toEqual([]);
+  });
+
+  it("still fails loud on a get_users error that is not a 403", async () => {
+    const { client } = fakeClient(instance());
+    const original = client.getAll;
+    client.getAll = (async (method: string, collection: string, params?: unknown) => {
+      if (method === "get_users") {
+        throw new TestRailError("get_users page 1 failed: 500 Server Error", 500);
+      }
+      return original.call(client, method, collection, params as never);
+    }) as TestRailClient["getAll"];
+
+    await expect(runApiImport(database, client)).rejects.toThrow(/500/);
+  });
+
+  it("names the import run to resume when it starts", async () => {
+    const { client } = fakeClient(instance());
+    const seen: number[] = [];
+    const { importRunId } = await runApiImport(database, client, {
+      onStart: (startedRunId) => seen.push(startedRunId),
+    });
+    expect(seen).toEqual([importRunId]);
+  });
+
   it("refuses a project id that is not on the instance", async () => {
     const { client } = fakeClient(instance());
     await expect(runApiImport(database, client, { projectSourceIds: [999] })).rejects.toThrow(
@@ -431,6 +548,70 @@ describe("api import", () => {
     expect(reconcile(report)).toEqual([]);
     expect(database.prepare("SELECT COUNT(*) AS total FROM cases").get()).toEqual({ total: 2 });
     expect(listTests(database, (database.prepare("SELECT id FROM runs WHERE source_id = 70").get() as { id: number }).id, {}).total).toBe(1);
+  });
+
+  /*
+    The shape a reconciliation failure leaves behind: state failed, cursor
+    complete. Resuming it used to run no stage, reconcile an empty report and
+    report done - telling the operator a broken import had recovered.
+  */
+  it("refuses a resume that has no stage left to run", async () => {
+    const first = fakeClient(instance());
+    await runApiImport(database, first.client);
+    const finished = getImportRun(database, 1);
+    expect(finished?.state).toBe("done");
+
+    // Same cursor, but a run that ended badly rather than well.
+    const stale = createImportRun(database, "testrail");
+    updateImportRun(database, stale, { state: "failed", cursor: finished?.cursor ?? null });
+
+    const second = fakeClient(instance());
+    await expect(runApiImport(database, second.client, { resumeFrom: stale })).rejects.toThrow(
+      /no stage left to run/,
+    );
+    // Not quietly promoted to done, and nothing was re-read.
+    expect(getImportRun(database, stale)?.state).toBe("failed");
+    expect(second.calls).not.toContain("get_cases/10");
+  });
+
+  /*
+    The combination that slipped past a first cut of the guard: a non-admin key
+    leaves the users stage un-checkpointed on purpose, so a resume always has
+    one stage to attempt. Attempting is not landing, and the resume still has
+    to be refused rather than reported as a recovery.
+  */
+  it("refuses a pointless resume even when a refused stage is retried", async () => {
+    // The wrapper throws before delegating, so a refused call never reaches
+    // `fake.calls`; count the attempts here instead.
+    let userAttempts = 0;
+    const forbid = (fake: Fake): void => {
+      const original = fake.client.getAll;
+      fake.client.getAll = (async (method: string, collection: string, params?: unknown) => {
+        if (method === "get_users") {
+          userAttempts += 1;
+          throw new TestRailError("get_users page 1 failed: 403 Access Denied", 403);
+        }
+        return original.call(fake.client, method, collection, params as never);
+      }) as TestRailClient["getAll"];
+    };
+
+    const first = fakeClient(instance());
+    forbid(first);
+    await runApiImport(database, first.client);
+    expect(userAttempts).toBe(1);
+    const finished = getImportRun(database, 1);
+
+    const stale = createImportRun(database, "testrail");
+    updateImportRun(database, stale, { state: "failed", cursor: finished?.cursor ?? null });
+
+    const second = fakeClient(instance());
+    forbid(second);
+    await expect(runApiImport(database, second.client, { resumeFrom: stale })).rejects.toThrow(
+      /no stage left to run/,
+    );
+    expect(getImportRun(database, stale)?.state).toBe("failed");
+    // It did retry users - that is the point - and still refused.
+    expect(userAttempts).toBe(2);
   });
 
   it("refuses to resume a finished import", async () => {
@@ -485,7 +666,7 @@ describe("api import regressions", () => {
     get_case_fields: [],
     get_priorities: [],
     get_case_types: [],
-    get_templates: [{ id: 1, name: "Test Case (Text)" }],
+    "get_templates/10": [{ id: 1, name: "Test Case (Text)" }],
     get_projects: [{ id: 10, name: "Payments", suite_mode: 1 }],
     "get_suites/10": [{ id: 20, name: "api" }],
     "get_milestones/10": [],
