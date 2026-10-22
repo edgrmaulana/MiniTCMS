@@ -2,7 +2,7 @@
 # from the same image the app runs on, and copied as built. A module compiled
 # against another libc fails at require time, not at build time, which is the
 # worst moment to find out.
-FROM node:lts-slim AS build
+FROM node:26.12.1-slim AS build
 WORKDIR /app
 
 # node-gyp's toolchain, when no prebuilt binary matches. The runtime stage
@@ -23,7 +23,7 @@ RUN npm run build
 # still gets a module built against its own libc.
 RUN npm ci --omit=dev
 
-FROM node:lts-slim
+FROM node:26.12.1-slim
 WORKDIR /app
 ENV NODE_ENV=production
 # One volume holds every piece of state: the database file and the uploaded
