@@ -66,9 +66,9 @@ pruned out, which was the one thing the pruned image could have broken.
 
 ## 1. Packaging
 
-- One `Dockerfile`, multi-stage, `node:lts-slim`. `better-sqlite3` is
-  native — build it in the build stage and copy the built module, or the
-  image breaks on a different libc.
+- One `Dockerfile`, multi-stage, `node:26.12.1-slim` (pinned to match
+  `.nvmrc`). `better-sqlite3` is native — build it in the build stage
+  and copy the built module, or the image breaks on a different libc.
 - One `docker-compose.yml`: the app, a named volume for `data.db` and
   attachments, env vars documented inline. No reverse proxy, no
   Postgres, no Redis in the default compose file. Add nothing a first-run

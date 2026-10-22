@@ -49,7 +49,7 @@ uploaded attachments both sit under `/app/data`. Back that volume up and you
 have backed up the instance. Env vars are documented inline in
 [`docker-compose.yml`](docker-compose.yml) and in Configuration below.
 
-From source instead:
+From source instead (Node 26.12.1, as pinned in `.nvmrc`):
 
 ```bash
 npm install
